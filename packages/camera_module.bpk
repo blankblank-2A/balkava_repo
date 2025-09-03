@@ -1,3 +1,4 @@
+# NOTE: THIS IS ONLY TEST FILE
 #!/system/bin/sh
 echo "Installing camera_module..."
 mkdir -p /data/local/tmp/balkava_a/sys/class/camera0
