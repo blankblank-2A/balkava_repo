@@ -1,0 +1,5 @@
+#!/system/bin/sh
+echo "Installing camera_module..."
+mkdir -p /data/local/tmp/balkava_a/sys/class/camera0
+echo "camera0=enabled" > /data/local/tmp/balkava_a/sys/class/camera0/info
+echo "Camera module installed ✅"
