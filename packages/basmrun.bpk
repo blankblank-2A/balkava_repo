@@ -1,0 +1,2463 @@
+#!/system/bin/sh
+# BASM interpreter - extended POSIX sh edition 🤑💀
+# source the library once at startup
+. /data/local/tmp/balkava_hardware/iommu/iommu_lib.sh
+
+BASM_FILE="$1"
+TMPDIR="/data/local/tmp/balkava_a/cache/basm_$$"
+mkdir -p "$TMPDIR"
+STATE_ROOT=/data/local/tmp/balkava_a
+# POSIX-compliant basmrun hardware API extension for Balkava OS
+LOGFILE="/data/local/tmp/balkava_hardware/logs.txt"
+mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+: > "$LOGFILE" 2>/dev/null || true
+
+# Global "registers"
+AL=0; BL=0; CL=0; DL=0; R0=0; R1=0
+
+get_arg() {
+    key=$1
+    shift
+    for arg in "$@"; do
+        case "$arg" in
+            "$key"=*)
+                echo "${arg#*=}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+# portable random byte (0-255)
+rand_byte() {
+    # awk rand() -> 0..1, seed with time + pid
+    awk 'BEGIN {srand(); printf("%d\n", int(rand()*256)); }'
+}
+
+# --- UARTPRINT: colored output via printf (portable) ---
+UARTPRINT() {
+    text=$1
+    color=${2:-32}  # default green
+    # expand "+ AL" and "+BL" simple tokens in text
+    # replace occurrences of "+ AL" or "+AL" with AL value (basic)
+    text="$(printf "%s" "$text" | sed -e "s/+ *AL/$AL/g" -e "s/+ *BL/$BL/g")"
+    printf "\033[%sm%s\033[0m\n" "$color" "$text"
+    printf "%s UART: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$text" >> "$LOGFILE" 2>/dev/null
+}
+
+# PRINT wrapper used by BASM scripts
+PRINT() {
+    text=$1
+    color=${2:-32}
+    UARTPRINT "$text" "$color"
+}
+
+# key=value parser helper (POSIX-safe)
+kv() {
+    key=$1
+    args=$2
+    # print the value for KEY in the args string or empty
+    printf "%s" "$args" | awk -v K="$key" '{
+        for (i=1;i<=NF;i++) {
+            if ($i ~ ("^"K"=")) {
+                sub("^"K"=", "", $i);
+                print $i; exit
+            }
+        }
+    }'
+}
+
+# log helper
+klog() {
+    printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOGFILE" 2>/dev/null
+}
+
+# -------------------------
+# Hardware simulation ops (POSIX)
+# -------------------------
+PCI_SCAN() { klog "PCI_SCAN"; UARTPRINT "PCI: scanning devices..." 36; AL=1; }
+PCI_READ() {
+    args=$*
+    dev=$(kv "DEV" "$args")
+    reg=$(kv "REG" "$args")
+    klog "PCI_READ DEV=$dev REG=$reg"
+    AL=$(rand_byte)
+    # show hex like before (printf %X not in POSIX? it is supported)
+    printfval=$(printf "%X" "$AL" 2>/dev/null || printf "%X" "$AL")
+    UARTPRINT "PCI_READ DEV=$dev REG=$reg -> 0x$printfval" 33
+}
+PCI_WRITE() {
+    klog "PCI_WRITE $*"; UARTPRINT "PCI_WRITE OK" 32; AL=0
+}
+
+RTC_READ() { AL=$(date '+%S'); klog "RTC_READ -> $AL"; }
+RTC_SET() { klog "RTC_SET $*"; UARTPRINT "RTC set: $*" 35; AL=0; }
+
+GPIO_SET() { args=$*; pin=$(kv "PIN" "$args"); val=$(kv "VAL" "$args")
+    klog "GPIO_SET PIN=$pin VAL=$val"; UARTPRINT "GPIO $pin -> $val" 33; AL=$val
+}
+GPIO_GET() { args=$*; pin=$(kv "PIN" "$args"); AL=$(awk 'BEGIN{srand(); print int(rand()*2)}'); klog "GPIO_GET PIN=$pin -> $AL"; }
+GPIO_MODE() { klog "GPIO_MODE $*"; UARTPRINT "GPIO mode set" 36; AL=0; }
+
+I2C_SCAN() { klog "I2C_SCAN $*"; AL=1; UARTPRINT "I2C: devices found" 33; }
+I2C_READ() { args=$*; klog "I2C_READ $args"; AL=$(rand_byte); UARTPRINT "I2C_READ -> $AL" 32; }
+I2C_WRITE() { klog "I2C_WRITE $*"; UARTPRINT "I2C_WRITE OK" 32; AL=0; }
+
+SPI_XFER() { klog "SPI_XFER $*"; AL=0; UARTPRINT "SPI_XFER DONE" 32; }
+
+ADC_READ() { args=$*; ch=$(kv "CH" "$args"); AL=$(awk 'BEGIN{srand(); print int(rand()*4096)}'); klog "ADC_READ CH=$ch -> $AL"; }
+DAC_WRITE() { klog "DAC_WRITE $*"; AL=0; }
+
+PWM_SET() { klog "PWM_SET $*"; UARTPRINT "PWM set" 36; AL=0; }
+
+TEMP_READ() { args=$*; dev=$(kv "DEV" "$args"); AL=$(awk 'BEGIN{srand(); print int(30 + rand()*50)}'); klog "TEMP_READ DEV=$dev -> $AL"; }
+FAN_SET() { args=$*; dev=$(kv "DEV" "$args"); speed=$(kv "SPEED" "$args"); klog "FAN_SET $dev SPEED=$speed"; AL=$speed; }
+FAN_GET() { AL=$(awk 'BEGIN{srand(); print int(rand()*100)}'); klog "FAN_GET -> $AL"; }
+
+FB_INIT() { klog "FB_INIT $*"; UARTPRINT "Framebuffer initted" 36; AL=0; }
+FB_PUTPIXEL() { klog "FB_PUTPIXEL $*"; AL=0; }
+FB_FILLRECT() { klog "FB_FILLRECT $*"; AL=0; }
+FB_SWAPBUF() { klog "FB_SWAPBUF"; AL=0; }
+
+AUDIO_INIT() { klog "AUDIO_INIT $*"; AL=0; }
+AUDIO_PLAY() { file=$(kv "FILE" "$*"); klog "AUDIO_PLAY $file"; UARTPRINT "Playing $file" 35; AL=0; }
+AUDIO_STOP() { klog "AUDIO_STOP"; AL=0; }
+
+BAT_STATUS() { AL=1; klog "BAT_STATUS -> ok"; }
+BAT_LEVEL() { AL=$(awk 'BEGIN{srand(); print int(rand()*100)}'); klog "BAT_LEVEL -> $AL"; }
+BAT_CHARGE() { klog "BAT_CHARGE $*"; AL=0; }
+
+# RNG: return hex string in AL
+RNG_HW() {
+    args=$*
+    size=$(kv "SIZE" "$args")
+    size=${size:-16}
+    out=""
+    i=1
+    while [ "$i" -le "$size" ]; do
+        b=$(rand_byte)
+        # format to two hex digits
+        hex=$(printf "%02X" "$b" 2>/dev/null || awk 'BEGIN{printf "%02X\n",'$b'}')
+        out="${out}${hex}"
+        i=$(expr "$i" + 1)
+    done
+    AL="$out"
+    klog "RNG_HW SIZE=$size -> $AL"
+}
+
+KB_READ() { AL=$(rand_byte); klog "KB_READ -> $AL"; }
+KB_LED() { klog "KB_LED $*"; AL=0; }
+
+SETREG() { reg=$1; val=$2; # eval like "AL=5"
+    case "$reg" in
+        AL|BL|CL|DL|R0|R1) eval "$reg=$val"; klog "SETREG $reg=$val"; AL=0 ;;
+        *) klog "SETREG unknown reg $reg"; AL=1 ;;
+    esac
+}
+GETREG() { reg=$1; case "$reg" in AL|BL|CL|DL|R0|R1) eval "printf '%s\n' \$$reg";; *) printf '\n';; esac }
+
+STARTDMA(){ klog "STARTDMA $*"; AL=1; }
+STOPDMA(){ klog "STOPDMA"; AL=0; }
+
+MOUSEEVENT(){ AL=$(awk 'BEGIN{srand(); print int(rand()*800)}'); BL=$(awk 'BEGIN{srand(); print int(rand()*600)}'); klog "MOUSEEVENT AL=$AL BL=$BL"; }
+PLAYSOUND(){ klog "PLAYSOUND $*"; AL=0; }
+SETTIMER(){ klog "SETTIMER $*"; AL=0; }
+STOPTIMER(){ klog "STOPTIMER $*"; AL=0; }
+
+SENDPACKET(){ klog "SENDPACKET $*"; AL=0; }
+RECEIVEPACKET(){ AL="DATA$(awk 'BEGIN{srand(); print int(rand()*1000)}')"; klog "RECEIVEPACKET -> $AL"; }
+
+KLOG_WRITE(){ msg=$(kv "MSG" "$*"); klog "KLOG_WRITE $msg"; AL=0; }
+# ----More damn KERNEL APIs ----
+# ---- EXTRA ROUND: NUCLEAR PACK (POSIX) ----
+STATE_ROOT=${STATE_ROOT:-/tmp/balkava_core}
+mkdir -p "$STATE_ROOT/boot/tlb" "$STATE_ROOT/boot/coherent" "$STATE_ROOT/boot/swap" "$STATE_ROOT/proc" "$STATE_ROOT/proc/" "$STATE_ROOT/sys/class/softirq" "$STATE_ROOT/tmp/dm" "$STATE_ROOT/tmp/overlay" "$STATE_ROOT/tmp/checkpoint" "$STATE_ROOT/tmp/oom" "$STATE_ROOT/tmp/cgroupv2" 2>/dev/null || true
+
+# 1) Tiny TLB cache (map iova->phys cached)
+tlb_put() {
+  key="$1"; phys="$2"
+  echo "$phys" > "$STATE_ROOT/boot/tlb/$key"
+  printf "OK\n"
+}
+tlb_get() {
+  key="$1"
+  if [ -f "$STATE_ROOT/boot/tlb/$key" ]; then
+    cat "$STATE_ROOT/boot/tlb/$key"
+  else
+    printf "MISS\n"
+  fi
+}
+tlb_invalidate() {
+  key="$1"; rm -f "$STATE_ROOT/boot/tlb/$key" 2>/dev/null || true; printf "OK\n"
+}
+tlb_flush() { rm -f "$STATE_ROOT/boot/tlb/"* 2>/dev/null || true; printf "OK\n" ;}
+
+# 2) Coherent DMA pool (simulate CPU-cache-coherent DMA)
+coherent_alloc() {
+  id="$1"; size="$2"
+  dd if=/dev/zero bs=1 count="$size" 2>/dev/null > "$STATE_ROOT/boot/coherent/$id"
+  printf "OK\n"
+}
+coherent_free() { rm -f "$STATE_ROOT/boot/coherent/$1" 2>/dev/null || true; printf "OK\n"; }
+coherent_sync_cpu_to_dev() { echo "SYNC CPU->DEV $1" ; }
+coherent_sync_dev_to_cpu() { echo "SYNC DEV->CPU $1" ; }
+
+# 3) Swap reclaimer sim (evict pages)
+swap_reclaim() {
+  pages="$1"
+  # pretend to free pages by removing oldest page files
+  cnt=0
+  for f in "$STATE_ROOT/config/page/"*; do
+    [ -f "$f" ] || continue
+    rm -f "$f"
+    cnt=`expr $cnt + 1`
+    [ "$cnt" -ge "$pages" ] && break
+  done
+  printf "RECLAIMED %s\n" "$cnt"
+}
+
+# 4) /proc fakery: expose custom entries
+proc_write() {
+  path="$1"; data="$2"
+  mkdir -p "$STATE_ROOT/proc/$(dirname "$path")" 2>/dev/null || true
+  printf "%s\n" "$data" > "$STATE_ROOT/proc/$path"
+  printf "OK\n"
+}
+proc_read() {
+  path="$1"
+  cat "$STATE_ROOT/proc/$path" 2>/dev/null || printf "(empty)\n"
+}
+proc_list() { find "$STATE_ROOT/proc" -type f 2>/dev/null | sed "s#^$STATE_ROOT/proc/##" || printf "(none)\n"; }
+
+# 5) Syscall injector (danger: test-only)
+syscall_inject() {
+  pid="$1"; name="$2"; args="$3"
+  # log as if a syscall happened
+  echo "$(date '+%F %T') INJECT pid=$pid syscall=$name args=$args" >> "$STATE_ROOT/dev/kmsg"
+  printf "OK\n"
+}
+
+# 6) Power governor model (tiny)
+gov_set() { cpu="$1"; gov="$2"; echo "$gov" > "$STATE_ROOT/sys/class/cpu/gov/$cpu"; printf "OK\n"; }
+gov_get() { cpu="$1"; cat "$STATE_ROOT/sys/class/cpu/gov/$cpu" 2>/dev/null || printf "ondemand\n"; }
+
+# 7) Userspace loader stub (validate ELF-like, fake mapping & start)
+userspace_load() {
+  pid="$1"; file="$2"
+  if [ ! -f "$file" ]; then printf "ERR:NOFILE\n"; return 1; fi
+  mkdir -p "$STATE_ROOT/proc/$pid"
+  echo "$file" > "$STATE_ROOT/proc/$pid/exe"
+  echo "LOADED" > "$STATE_ROOT/proc/$pid/state"
+  printf "OK\n"
+}
+userspace_run() {
+  pid="$1"
+  if [ -f "$STATE_ROOT/proc/$pid/exe" ]; then
+    printf "RUNNING %s\n" "$(cat "$STATE_ROOT/proc/$pid/exe")"
+  else
+    printf "ERR:NOPROC\n"
+  fi
+}
+
+# 8) Scheduler load balancer (move PID -> CPU)
+sched_balance_move() {
+  pid="$1"; cpu="$2"
+  mkdir -p "$STATE_ROOT/sys/kernel/debug/sched/assignment"
+  echo "$cpu" > "$STATE_ROOT/sys/kernel/debug/sched/assignment/$pid"
+  printf "OK\n"
+}
+sched_balance_show() {
+  for f in "$STATE_ROOT/sys/kernel/debug/sched/assignment/"*; do [ -f "$f" ] || continue; printf "%s -> %s\n" "$(basename "$f")" "$(cat "$f")"; done
+}
+
+# 9) cgroupv2 basic (create/remove/limit/list)
+cgroupv2_create() { name="$1"; mkdir -p "$STATE_ROOT/sys/class/cgroupv2/$name"; printf "OK\n"; }
+cgroupv2_set_limit() { name="$1"; mem="$2"; echo "$mem" > "$STATE_ROOT/sys/class/cgroupv2/$name/memory.max"; printf "OK\n"; }
+cgroupv2_list() { for d in "$STATE_ROOT/sys/class/cgroupv2/"*; do [ -d "$d" ] && printf "%s\n" "$(basename "$d")"; done; }
+
+# 10) OOM killer stub (choose victim by heuristic)
+oom_kill() {
+  # pick random process file under ps/
+  victim=""
+  for f in "$STATE_ROOT/proc/"*; do [ -d "$f" ] || continue; victim="$(basename "$f")"; break; done
+  if [ -z "$victim" ]; then printf "NOPROC\n"; else rm -rf "$STATE_ROOT/proc/$victim"; printf "KILLED %s\n" "$victim"; fi
+}
+
+# 11) Demand paging / pager (simulate page fault & load on access)
+pager_set_backing() {
+  pid="$1"; pageid="$2"; file="$3"
+  mkdir -p "$STATE_ROOT/proc/$pid"
+  echo "$file" > "$STATE_ROOT/proc/$pid/$pageid"
+  printf "OK\n"
+}
+pager_handle_fault() {
+  pid="$1"; pageid="$2"
+  if [ -f "$STATE_ROOT/proc/$pid/$pageid" ]; then
+    file=$(cat "$STATE_ROOT/proc/$pid/$pageid")
+    printf "PAGE_LOADED %s FOR %s\n" "$file" "$pid"
+  else
+    printf "PAGE_NOT_FOUND\n"
+  fi
+}
+
+# 12) Softirq / softnet toy (schedule bottom-half handler labels)
+softirq_raise() {
+  id="$1"; echo "$id" >> "$STATE_ROOT/sys/class/softirq/queue"; printf "OK\n"
+}
+softirq_run() {
+  while IFS= read -r h; do [ -n "$h" ] || continue; printf "HANDLER:%s\n" "$h"; done < "$STATE_ROOT/sys/class/softirq/queue" 2>/dev/null || true
+  > "$STATE_ROOT/sys/class/softirq/queue" 2>/dev/null || true
+}
+
+# 13) Device Mapper-ish table (create map and snapshot)
+dm_table_add() {
+  name="$1"; devs="$2"; echo "$devs" > "$STATE_ROOT/tmp/dm/$name"; printf "OK\n"
+}
+dm_table_get() { name="$1"; cat "$STATE_ROOT/tmp/dm/$name" 2>/dev/null || printf "NOTFOUND\n"; }
+dm_snapshot() { name="$1"; snap="$2"; cp -a "$STATE_ROOT/tmp/dm/$name" "$STATE_ROOT/tmp/dm/$snap" 2>/dev/null || true; printf "SNAPOK\n"; }
+
+# 14) Overlayfs mock (upper/lower)
+overlay_mount() {
+  name="$1"; lower="$2"; upper="$3"
+  mkdir -p "$STATE_ROOT/tmp/overlay/$name"
+  echo "LOWER=$lower" > "$STATE_ROOT/tmp/overlay/$name/info"
+  echo "UPPER=$upper" >> "$STATE_ROOT/tmp/overlay/$name/info"
+  printf "OK\n"
+}
+overlay_ls() { name="$1"; cat "$STATE_ROOT/tmp/overlay/$name/info" 2>/dev/null || printf "NONE\n"; }
+
+# 15) Checkpoint / restore (serialize process directory)
+checkpoint_create() { pid="$1"; ck="$2"; tar -cf "$STATE_ROOT/tmp/checkpoint/$ck.tar" -C "$STATE_ROOT/ps" "$pid" 2>/dev/null || true; printf "OK\n"; }
+checkpoint_restore() { ck="$1"; tar -xf "$STATE_ROOT/tmp/checkpoint/$ck.tar" -C "$STATE_ROOT/tmp/poop" 2>/dev/null || true; printf "OK\n"; }
+
+# 16) Admin: list modules & symbol stub
+mod_list() { ls "$STATE_ROOT/sys/module" 2>/dev/null || printf "(none)\n"; }
+mod_symbols() { mod="$1"; printf "sym_foo 0xdeadbeef\n"; }
+
+# 17) Sysadmin tiny tools (parse boot args)
+bootparam_set() { key="$1"; val="$2"; echo "$val" > "$STATE_ROOT/boot/$key"; printf "OK\n"; }
+bootparam_get() { key="$1"; cat "$STATE_ROOT/boot/$key" 2>/dev/null || printf "(unset)\n"; }
+
+mkdir -p "$STATE_ROOT/dma" "$STATE_ROOT/numa" "$STATE_ROOT/cgroup" "$STATE_ROOT/klog" "$STATE_ROOT/page" "$STATE_ROOT/timer" 2>/dev/null || true
+# ---- MASSIVE EXTRA KERNEL API PACK (POSIX) ----
+mkdir -p "${STATE_ROOT:-/tmp/balkava_core}/sys/perf" "${STATE_ROOT:-/tmp/balkava_core},/sys/class/watchdog" 2>/dev/null || true 
+
+# 1) Perf counters (start/stop/read)
+perf_start() {
+  name=$1
+  echo "$(date +%s)" > "${STATE_ROOT:-/tmp/balkava_core}/sys/perf/$name.start" 2>/dev/null || true
+  printf "OK\n"
+}
+
+perf_stop() {
+  name=$1
+  startf="${STATE_ROOT:-/tmp/balkava_core}/sys/perf/$name.start"
+  [ -f "$startf" ] || { printf "ERR\n"; return 1; }
+  start=$(cat "$startf")
+  dur=$(( $(date +%s) - start ))
+  echo "$dur" > "${STATE_ROOT:-/tmp/balkava_core}/sys/perf/$name" 2>/dev/null || true
+  rm -f "$startf" 2>/dev/null || true
+  printf "OK\n"
+}
+perf_read() {
+  name=$1
+  cat "${STATE_ROOT:-/tmp/balkava_core}/sys/perf/$name" 2>/dev/null || printf "0\n"
+}
+
+# 2) Watchdog (set/kick/status)
+watchdog_set() {
+  id=$1; ms=$2
+  echo "$ms" > "${STATE_ROOT:-/tmp/balkava_core}/sys/class/watchdog/$id"
+  printf "OK\n"
+}
+watchdog_kick() {
+  id=$1
+  if [ -f "${STATE_ROOT:-/tmp/balkava_core}/sys/class/watchdog/$id" ]; then
+    echo "$(date +%s)" > "${STATE_ROOT:-/tmp/balkava_core}/watchdog/$id.last"
+    printf "KICKED\n"
+  else
+    printf "NOTSET\n"
+  fi
+}
+watchdog_status() {
+  id=$1
+  ls -l "${STATE_ROOT:-/tmp/balkava_core}/sys/class/watchdog/$id" 2>/dev/null || printf "NONE\n"
+}
+
+# 3) Firmware loader stub (load/unload/list)
+fw_load() {
+  dev=$1; file=$2
+  mkdir -p "${STATE_ROOT:-/tmp/balkava_core}/firmware" 2>/dev/null || true
+  echo "$file" > "${STATE_ROOT:-/tmp/balkava_core}/firmware/$dev"
+  printf "OK\n"
+}
+fw_unload() {
+  dev=$1
+  rm -f "${STATE_ROOT:-/tmp/balkava_core}/firmware/$dev" 2>/dev/null || true
+  printf "OK\n"
+}
+fw_list() {
+  for f in "${STATE_ROOT:-/tmp/balkava_core}/firmware/"*; do [ -f "$f" ] && printf "%s: %s\n" "$(basename "$f")" "$(cat "$f")"; done 2>/dev/null
+}
+
+# 4) CPUfreq mock (set/get governor & frequency)
+cpufreq_set() { cpu=$1; gov=$2; freq=$3; mkdir -p "${STATE_ROOT:-/tmp/balkava_core}/sys/cpufreq"; echo "$gov,$freq" > "${STATE_ROOT:-/tmp/balkava_core}/sys/cpufreq/$cpu"; printf "OK\n"; }
+cpufreq_get() { cpu=$1; cat "${STATE_ROOT:-/tmp/balkava_core}/sys/class/cpu/cpufreq/$cpu" 2>/dev/null || printf "ondemand,0\n"; }
+
+# 5) Entropy pool (seed/read)
+entropy_seed() { printf "%s\n" "$2" >> "${STATE_ROOT:-/tmp/balkava_core}/boot/entropy/seed"; printf "OK\n"; }
+entropy_read() { head -c "${1:-16}" /dev/urandom | xxd -p -c "${1:-16}"; }
+
+# 6) Swap simulate (set swappiness / show)
+swap_set_swappiness() { v=$1; echo "$v" > "${STATE_ROOT:-/tmp/balkava_core}/boot/swap/swappiness"; printf "OK\n"; }
+swap_show() { cat "${STATE_ROOT:-/tmp/balkava_core}/boot/swap/swappiness" 2>/dev/null || printf "60\n"; }
+
+# 7) Seccomp-like small filter (allow/deny by syscall name)
+seccomp_allow() { echo "ALLOW $1" >> "${STATE_ROOT:-/tmp/balkava_core}/boot/seccomp.rules"; printf "OK\n"; }
+seccomp_deny() { echo "DENY $1" >> "${STATE_ROOT:-/tmp/balkava_core}/boot/seccomp.rules"; printf "OK\n"; }
+seccomp_list() { cat "${STATE_ROOT:-/tmp/balkava_core}/seccomp.rules" 2>/dev/null || printf "(none)\n"; }
+
+# 8) Audit event (log + query)
+audit_log() { who=$1; what=$2; echo "$(date '+%F %T') $who $what" >> "${STATE_ROOT:-/tmp/balkava_core}/boot/audit.log"; printf "OK\n"; }
+audit_query() { grep "$1" "${STATE_ROOT:-/tmp/balkava_core}/audit.log" 2>/dev/null || printf "(no events)\n"; }
+
+# 9) Hotplug device attach/detach (and list)
+hotplug_attach() { dev=$1; echo "$(date +%s)" > "${STATE_ROOT:-/tmp/balkava_core}/dev/$dev"; printf "ATTACHED\n"; }
+hotplug_detach() { dev=$1; rm -f "${STATE_ROOT:-/tmp/balkava_core}/sys/class/hotplug/$dev" 2>/dev/null || true; printf "DETACHED\n"; }
+hotplug_list() { for f in "${STATE_ROOT:-/tmp/balkava_core}/hotplug/"*; do [ -f "$f" ] && printf "%s\n" "$(basename "$f")"; done 2>/dev/null; }
+
+# 10) Kernel module param setter (fake /sys/module/..)
+modparam_set() { mod=$1; param=$2; val=$3; mkdir -p "${STATE_ROOT:-/tmp/balkava_core}/sys/module/$mod/"; echo "$val" > "${STATE_ROOT:-/tmp/balkava_core}/sys/module/$mod/$param"; printf "OK\n"; }
+modparam_get() { mod=$1; param=$2; cat "${STATE_ROOT:-/tmp/balkava_core}/sys/module/$mod/$param" 2>/dev/null || printf "undef\n"; }
+
+# 11) Namespace mock (create/list/enter)
+ns_create() { name=$1; mkdir -p "${STATE_ROOT:-/tmp/balkava_core}/ns/$name"; printf "OK\n"; }
+ns_list() { for n in "${STATE_ROOT:-/tmp/balkava_core}/ns/"*; do [ -d "$n" ] && printf "%s\n" "$(basename "$n")"; done 2>/dev/null; }
+ns_enter() { name=$1; [ -d "${STATE_ROOT:-/tmp/balkava_core}/ns/$name" ] && printf "ENTERED %s\n" "$name" || printf "NO_NS\n"; }
+
+# 12) eBPF stub register/unregister/run (fake)
+ebpf_load() { id=$1; echo "$2" > "${STATE_ROOT:-/tmp/balkava_core}/sys/ebpf/$id" 2>/dev/null || true; printf "OK\n"; }
+ebpf_unload() { id=$1; rm -f "${STATE_ROOT:-/tmp/balkava_core}/ebpf/$id" 2>/dev/null || true; printf "OK\n"; }
+ebpf_run() { id=$1; echo "RUN:$id" >> "${STATE_ROOT:-/tmp/balkava_core}/dev/kmsg"; printf "OK\n"; }
+
+# 13) Kernel panic simulation (dump state)
+panic_dump() {
+  echo "PANIC DUMP: $(date '+%F %T')" > "${STATE_ROOT:-/tmp/balkava_core}/misc/dump"
+  echo "perf:"; ls "${STATE_ROOT:-/tmp/balkava_core}/perf" 2>/dev/null || true
+  printf "DUMPED\n"
+}
+
+# 14) Throttle/mock CPU offline (take cpu offline)
+cpu_offline() { id=$1; echo "offline" > "${STATE_ROOT:-/tmp/balkava_core}/sys/cpu/$id"; printf "OK\n"; }
+cpu_online()  { id=$1; echo "online" > "${STATE_ROOT:-/tmp/balkava_core}/sys/cpu/$id"; printf "OK\n"; }
+cpu_status()  { id=$1; cat "${STATE_ROOT:-/tmp/balkava_core}/sys/cpu/$id" 2>/dev/null || printf "online\n"; }
+
+# 15) Kernel ring buffer reader (circular tail)
+ring_write() { echo "$(date '+%H:%M:%S') $*" >> "${STATE_ROOT:-/tmp/balkava_core}/config/ring"; tail -n 200 "${STATE_ROOT:-/tmp/balkava_core}/ring" > "${STATE_ROOT:-/tmp/balkava_core}/ring.tmp" 2>/dev/null || true; mv "${STATE_ROOT:-/tmp/balkava_core}/ring.tmp" "${STATE_ROOT:-/tmp/balkava_core}/ring" 2>/dev/null || true; }
+ring_read() { tail -n "${1:-50}" "${STATE_ROOT:-/tmp/balkava_core}/ring" 2>/dev/null || printf "(empty)\n"; }
+
+# -- DMA buffer pool --
+dma_alloc() {
+  id=$1; size=$2
+  dd if=/dev/zero bs=1 count="$size" 2>/dev/null > "$STATE_ROOT/sys/class/dma/$id"
+  printf "DMA buffer %s allocated (%s bytes)\n" "$id" "$size"
+}
+dma_free() {
+  rm -f "$STATE_ROOT/dma/$1" 2>/dev/null || true
+  printf "DMA buffer %s freed\n" "$1"
+}
+
+# -- NUMA node sim --
+numa_add_node() {
+  id=$1; cpus=$2
+  echo "$cpus" > "$STATE_ROOT/sys/class/numa/$id"
+  printf "NUMA node %s with CPUs %s added\n" "$id" "$cpus"
+}
+numa_list_nodes() {
+  for n in "$STATE_ROOT/sys/class/numa/"*; do
+    [ -f "$n" ] && printf "Node %s: CPUs %s\n" "$(basename "$n")" "$(cat "$n")"
+  done
+}
+
+# -- Cgroups mock --
+cgroup_create() {
+  name=$1
+  mkdir -p "$STATE_ROOT/sys/cgroup/$name"
+  printf "Cgroup %s created\n" "$name"
+}
+cgroup_add_task() {
+  name=$1; pid=$2
+  echo "$pid" >> "$STATE_ROOT/sys/cgroup/$name/tasks"
+  printf "PID %s added to cgroup %s\n" "$pid" "$name"
+}
+cgroup_list() {
+  for cg in "$STATE_ROOT/sys/cgroup/"*; do
+    [ -d "$cg" ] && {
+      printf "Cgroup %s: " "$(basename "$cg")"
+      cat "$cg/tasks" 2>/dev/null || printf "(empty)\n"
+    }
+  done
+}
+
+# -- Kernel log ringbuffer --
+klog_read() {
+  cat "$STATE_ROOT/dev/kmsg" 2>/dev/null || printf "(no logs)\n"
+}
+
+# -- Page allocator mock --
+page_alloc() {
+  id=$1; count=$2
+  dd if=/dev/zero bs=4096 count="$count" 2>/dev/null > "$STATE_ROOT/sys/class/page/$id"
+  printf "Allocated %s pages for %s\n" "$count" "$id"
+}
+page_free() {
+  rm -f "$STATE_ROOT/sys/class/page/$1" 2>/dev/null || true
+  printf "Freed pages for %s\n" "$1"
+}
+
+# -- Timer subsystem --
+timer_set() {
+  id=$1; ms=$2
+  echo "$ms" > "$STATE_ROOT/config/timer/$id"
+  printf "Timer %s set to %sms\n" "$id" "$ms"
+}
+timer_get() {
+  id=$1
+  [ -f "$STATE_ROOT/config/timer/$id" ] && cat "$STATE_ROOT/config/timer/$id" || printf "NOTSET\n"
+}
+# ---- EXTRA KERNEL APIs ----
+mkdir -p "$STATE_ROOT/.tmp/mutex" "$STATE_ROOT/irq" "$STATE_ROOT/cache" "$STATE_ROOT/sysinfo" "$STATE_ROOT/traps" "$STATE_ROOT/sched" 2>/dev/null || true
+
+# -- Mutex lock/unlock --
+mutex_lock() {
+  name=$1
+  lockf="$STATE_ROOT/mutex/$name.lock"
+  if [ -f "$lockf" ]; then
+    printf "BUSY\n"; return 1
+  fi
+  echo $$ > "$lockf"
+  printf "LOCKED\n"
+}
+mutex_unlock() {
+  name=$1
+  rm -f "$STATE_ROOT/.tmp/mutex/$name.lock" 2>/dev/null || true
+  printf "UNLOCKED\n"
+}
+
+# -- IRQ (simulate interrupt registration/trigger) --
+irq_register() {
+  num=$1; handler=$2
+  echo "$handler" > "$STATE_ROOT/sys/class/irq/$num"
+  printf "OK\n"
+}
+irq_trigger() {
+  num=$1
+  [ -f "$STATE_ROOT/irq/$num" ] && cat "$STATE_ROOT/irq/$num" || printf "NOHANDLER\n"
+}
+
+# -- CPU cache control (fake flush/invalidate) --
+cache_flush() {
+  level=$1
+  printf "CACHE L%s FLUSHED\n" "$level"
+}
+cache_invalidate() {
+  level=$1
+  printf "CACHE L%s INVALIDATED\n" "$level"
+}
+
+# -- System info dump --
+sysinfo_dump() {
+  buname -r
+  printf "STATE_ROOT=%s\n" "$STATE_ROOT"
+  printf "PID=%s\n" "$$"
+}
+
+# -- Trap table (register and show) --
+trap_set() {
+  id=$1; action=$2
+  echo "$action" > "$STATE_ROOT/.tmp/traps/$id"
+  printf "OK\n"
+}
+trap_show() {
+  id=$1
+  [ -f "$STATE_ROOT/.tmp/traps/$id" ] && cat "$STATE_ROOT/traps/$id" || printf "NONE\n"
+}
+
+# -- Scheduler tweak (set quantum per task) --
+sched_set_quantum() {
+  pid=$1; ms=$2
+  echo "$ms" > "$STATE_ROOT/sys/kernel/sched/$pid"
+  printf "OK\n"
+}
+sched_get_quantum() {
+  pid=$1
+  [ -f "$STATE_ROOT/sys/kernel/sched/$pid" ] && cat "$STATE_ROOT/sys/kernel/sched/$pid" || printf "DEFAULT\n"
+}
+# --- hardware functions ---
+keyboard_interrupt() {
+    local key=$((RANDOM % 256))
+    echo "Keyboard interrupt: key=$key" >> /data/local/tmp/balkava_hardware/logs.txt
+    AL=$key
+}
+# ---- EXTRA KERNEL APIs (POSIX) ----
+mkdir -p "$STATE_ROOT/timers" "$STATE_ROOT/sys/class/ipc" "$STATE_ROOT/power" "$STATE_ROOT/fault" 2>/dev/null || true
+
+# -- Timer API (create/cancel) --
+# TIMER_CREATE ID=<id> MS=<millis> CALLBACK=<label>
+timer_create() {
+  id=$1; ms=$2; cb=$3
+  printf "%s\n" "$ms:$cb" > "$STATE_ROOT/config/timers/$id" 2>/dev/null || true
+  printf "OK\n"
+}
+timer_cancel() {
+  id=$1
+  rm -f "$STATE_ROOT/config/timers/$id" 2>/dev/null || { printf "ERR\n"; return 1; }
+  printf "OK\n"
+}
+timer_list() {
+  for f in "$STATE_ROOT"/config/timers/*; do [ -f "$f" ] || continue; basename "$f"; done 2>/dev/null
+}
+
+# -- IPC (very small message queue) --
+# IPC_SEND Q=<id> FROM=<who> MSG="text"
+# IPC_RECV Q=<id>
+ipc_send() {
+  q=$1; from=$2; msg=$3
+  mkdir -p "$STATE_ROOT/sys/class/ipc/$q" 2>/dev/null || true
+  printf "%s|%s\n" "$from" "$msg" >> "$STATE_ROOT/sys/class/ipc/$q/msgs"
+  printf "OK\n"
+}
+ipc_recv() {
+  q=$1
+  f="$STATE_ROOT/sys/class/ipc/$q/msgs"
+  if [ -f "$f" ]; then
+    sed -n '1p' "$f"
+    # drop the first line (consume)
+    tail -n +2 "$f" > "$f.tmp" 2>/dev/null || true
+    mv "$f.tmp" "$f" 2>/dev/null || true
+  else
+    printf "\n"
+  fi
+}
+
+# -- Device power (suspend/resume state) --
+# DEV_POWER DEV=<name> ACTION=<suspend|resume|state>
+dev_power() {
+  dev=$1; act=$2
+  mkdir -p "$STATE_ROOT/sys/power" 2>/dev/null || true
+  case "$act" in
+    suspend) echo "suspended" > "$STATE_ROOT/sys/power/$dev"; printf "OK\n" ;;
+    resume) echo "on" > "$STATE_ROOT/sys/power/$dev"; printf "OK\n" ;;
+    state) [ -f "$STATE_ROOTl/sys/power/$dev" ] && cat "$STATE_ROOT/sys/power/$dev" || echo "unknown";;
+    *) printf "ERR\n"; return 1 ;;
+  esac
+}
+
+# -- Page-table map with alignment check (PT_MAP) --
+# PT_MAP PID=<pid> VADDR=0x... PADDR=0x... SIZE=<bytes> (enforces 4096 alignment)
+pt_map_safe() {
+  pid=$1; vaddr=$2; paddr=$3; size=$4
+  # check alignment (4096)
+  vdec=$(printf "%d" "$vaddr" 2>/dev/null || printf "%d" "0")
+  pdec=$(printf "%d" "$paddr" 2>/dev/null || printf "%d" "0")
+  modv=`expr $vdec % 4096`
+  modp=`expr $pdec % 4096`
+  if [ "$modv" -ne 0 ] || [ "$modp" -ne 0 ]; then
+    printf "ERR:ALIGN\n"; return 1
+  fi
+  mkdir -p "$STATE_ROOT/proc/$pid" 2>/dev/null || true
+  printf "%s,%s,%s\n" "$vaddr" "$paddr" "$size" >> "$STATE_ROOT/proc/$pid/maps"
+  printf "OK\n"
+}
+
+# -- Random fault injector (for testing resilience) --
+# FAULT_INJECT TARGET=<subsystem> TYPE=<panic|delay|drop> PROB=<0-100>
+fault_inject() {
+  target=$1; typ=$2; prob=$3
+  mkdir -p "$STATE_ROOT/.tmp/fault" 2>/dev/null || true
+  printf "%s|%s|%s\n" "$target" "$typ" "$prob" > "$STATE_ROOT/fault/$target"
+  printf "OK\n"
+}
+fault_status() {
+  target=$1
+  [ -f "$STATE_ROOT/.tmp/fault/$target" ] && cat "$STATE_ROOT/fault/$target" || printf "none\n"
+}
+
+timer_interrupt() {
+    local tick=$((RANDOM % 1000))
+    echo "Timer tick: $tick" >> /data/local/tmp/balkava_hardware/logs.txt
+    AL=$tick
+}
+
+disk_error_check() {
+    local sector="$1"
+    local fail=$((RANDOM % 10))
+    if [ $fail -eq 0 ]; then
+        echo "Disk error on sector $sector!" >> /data/local/tmp/balkava_hardware/logs.txt
+    else
+        echo "Disk sector $sector OK" >> /data/local/tmp/balkava_hardware/logs.txt
+    fi
+}
+
+random_hardware_event() {
+    local event=$((RANDOM % 3))
+    case $event in
+        0) keyboard_interrupt ;;
+        1) timer_interrupt ;;
+        2) disk_error_check $((RANDOM % 10)) ;;
+    esac
+}
+# --- PRINT function for basmrun ---
+PRINT() {
+    local text="$1"
+    local color="${2:-32}"   # default green
+    echo "$text" "$color"
+}
+
+# --- Hardware simulation functions for basmrun ---
+readport() {
+    local port="$1"
+    # simulate reading from hardware port
+    # just return a fake value
+    echo "AB"   # always return 0xAB for testing
+}
+
+writeport() {
+    local port="$1"
+    local value="$2"
+    # simulate writing to hardware port
+    echo "Wrote $value to PORT $port" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+pollstatus() {
+    local port="$1"
+    local status=0
+    while [ $status -lt 5 ]; do
+        status=$((status + 1))
+        sleep 0.01
+    done
+
+# Memory access (fake)
+READMEM() {
+    local addr="$1"
+    val=$((RANDOM % 256))
+    echo "$val"
+}
+
+WRITEMEM() {
+    local addr="$1"
+    local value="$2"
+    echo "Wrote $value to MEM $addr" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+# Fake CPU flags
+SETFLAG() {
+    local flag="$1"
+    echo "Flag $flag SET" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+CLEARFLAG() {
+    local flag="$1"
+    echo "Flag $flag CLEARED" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+# Simulate interrupts queue
+TRIGGERINT() {
+    local intnum="$1"
+    echo "Interrupt $intnum triggered" >> /data/local/tmp/balkava_hardware/logs.txt
+    AL=$((RANDOM % 256))   # store random value in AL
+}
+
+# Hardware timer + RTC
+READRTC() {
+    val=$(date +%S)
+    echo "$val"
+}
+
+WRITERTC() {
+    local val="$1"
+    echo "RTC set to $val" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+# GPU / Display simulation
+WRITEVIDEO() {
+    local addr="$1"
+    local val="$2"
+    echo "Wrote $val to video memory $addr" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+READVIDEO() {
+    local addr="$1"
+    val=$((RANDOM % 256))
+    echo "$val"
+}
+
+# --- DMA simulation ---
+STARTDMA() {
+    local src="$1"
+    local dst="$2"
+    local size="$3"
+    echo "DMA started from $src -> $dst, size=$size" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+# ---- Kernel function: VFS Mount ----
+vfs_mount() {
+    local src="$1" type="$2" mnt="$3"
+    mkdir -p "/data/local/tmp/balkava_a/tmp/balkava_vfs$mnt"
+    echo "Mounted $src of type $type to $mnt"
+}
+
+# ---- Kernel function: Scheduler Create ----
+sched_create() {
+    local pid="$1" name="$2" pri="$3"
+    echo "$pid,$name,$pri" >> /data/local/tmp/balkava_sched_table
+    echo "Process $name (PID $pid) created with priority $pri"
+}
+
+STOPDMA() {
+    echo "DMA stopped" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+# --- Keyboard / Mouse ---
+MOUSEEVENT() {
+    local x=$((RANDOM % 800))
+    local y=$((RANDOM % 600))
+    echo "Mouse event at $x,$y" >> /data/local/tmp/balkava_hardware/logs.txt
+    AL=$x
+    BL=$y
+}
+
+# --- Sound / Speaker ---
+PLAYSOUND() {
+    local freq="$1"
+    local dur="$2"
+    echo "Playing sound freq=$freq Hz, duration=${dur}ms" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+# --- Advanced Timer ---
+SETTIMER() {
+    local timer="$1"
+    local interval="$2"
+    echo "Timer $timer set to interval $interval ms" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+STOPTIMER() {
+    local timer="$1"
+    echo "Timer $timer stopped" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+# --- Network simulation ---
+SENDPACKET() {
+    local ip="$1"
+    local port="$2"
+    local data="$3"
+    echo "Sent packet to $ip:$port, data=$data" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+
+RECEIVEPACKET() {
+    local ip="$1"
+    local port="$2"
+    val="DATA$((RANDOM % 1000))"
+    echo "Received packet from $ip:$port -> $val" >> /data/local/tmp/balkava_hardware/logs.txt
+    AL="$val"
+}
+# --------- end of hardware API functions ---------------
+    echo "Status ready on port $port" >> /data/local/tmp/balkava_hardware/logs.txt
+}
+# ---- helpers -----------------------------
+num_to_fg() {
+  case "$1" in
+    0) printf '37' ;;  # white
+    1) printf '31' ;;  # red
+    2) printf '32' ;;  # green
+    3) printf '34' ;;  # blue
+    4) printf '90' ;;  # gray
+    5) printf '33' ;;  # yellow
+    6) printf '35' ;;  # violet
+    *) printf '37' ;;
+  esac
+}
+
+num_to_bg() {
+  case "$1" in
+    0) printf '47' ;;
+    1) printf '41' ;;
+    2) printf '42' ;;
+    3) printf '44' ;;
+    4) printf '100' ;;
+    5) printf '43' ;;
+    6) printf '45' ;;
+    *) printf '40' ;;   # sane default background
+  esac
+}
+
+# Safe extractors
+extract_quoted_text() {  # gets first "..." chunk
+  printf '%s\n' "$1" | sed -n 's/.*"\(.*\)".*/\1/p'
+}
+
+extract_count() {        # gets ;N (N digits), whitespace tolerated
+  printf '%s\n' "$1" | sed -n 's/.*;[[:space:]]*\([0-9][0-9]*\).*/\1/p'
+}
+
+# Extract fg and bg numbers (supports "#2  #1" or "2 1")
+extract_fg() {
+  # only look before the first quote so spaces in the string don't ruin it
+  printf '%s\n' "$1" | sed -n 's/^MULTIUARTPRINT[[:space:]]*#\{0,1\}\([0-6]\)[[:space:]]*#\{0,1\}\([0-6]\).*/\1/p'
+}
+extract_bg() {
+  printf '%s\n' "$1" | sed -n 's/^MULTIUARTPRINT[[:space:]]*#\{0,1\}\([0-6]\)[[:space:]]*#\{0,1\}\([0-6]\).*/\2/p'
+}
+# -------------------------------------------------------------------
+
+# init regs
+for i in 0 1 2 3 4 5 6 7; do eval "reg$i=0"; done
+sp=0
+stack_file="$TMPDIR/stack"
+touch "$stack_file"
+last_cmp=1
+
+# load lines
+i=0
+while IFS= read -r line; do
+    echo "$line" > "$TMPDIR/line_$i"
+    i=$((i+1))
+done < "$BASM_FILE"
+total=$i
+
+# record labels
+i=0
+while [ $i -lt $total ]; do
+    line=$(cat "$TMPDIR/line_$i")
+    case "$line" in
+        *:)
+            label=$(echo "$line" | sed 's/:.*//')
+            eval "label_$label=$i"
+            ;;
+    esac
+    i=$((i+1))
+done
+
+# run
+pc=0
+running=1
+
+while [ $running -eq 1 ]; do
+    [ $pc -ge $total ] && break
+    line=$(cat "$TMPDIR/line_$pc" | sed 's/;.*//;s/^ *//;s/ *$//')
+    pc=$((pc+1))
+    [ -z "$line" ] && continue
+
+    set -- $line
+    instr=$1
+
+    # helpers
+    getval() {
+        if echo "$1" | grep -q '^#'; then echo $(( ${1#\#} ))
+        else idx=${1#r}; eval echo "\$reg$idx"; fi
+    }
+
+    setreg() { idx=${1#r}; eval "reg$idx=$2"; }
+
+
+getreg() {
+    reg=$1
+    eval "echo \$$reg"
+}
+    case "$instr" in      # THIS CASE IS HOLDS ALL FUNCTIONS ON BASM  
+SYSCALL|syscall)
+ARG=$@
+echo $ARG >> /data/local/tmp/balkava_a/proc/syscall_queue
+;;
+INIT)
+    code=$2
+    arg=$3
+    # if arg starts with #, treat as number, else string
+    if echo "$arg" | grep -q '^#'; then
+        arg=${arg#\#}
+    fi
+
+    case "$code" in
+        0) 
+            echo "[INIT]: Program exited (code $arg)"
+            exit "$arg"
+            ;;
+        1) 
+            echo "[INIT]: Dumping registers"
+            set | grep '^r[0-9]*='
+            ;;
+        2)
+            echo "[INIT]: Dumping memory"
+            set | grep '^mem'
+            ;;
+        3)
+            echo "[INIT]: Hello from basmrun syscall 3!"
+            ;;
+        4)
+            # print string arg
+            if [ -n "$arg" ]; then
+                echo "[INIT]: $arg"
+            else
+                echo "[INIT]: Nothing to print"
+            fi
+            ;;
+        5)
+            # random math demo
+            r=$((RANDOM % 1000))
+            echo "[INIT]: Generated random number $r"
+            ;;
+        *)
+            echo "[INIT]: Unknown syscall $code"
+            ;;
+    esac
+    ;;
+    B.EQ) # Branch if equal
+        label=$(echo "$args" | awk '{print $1}')
+        if [ "$FLAG_Z" = 1 ]; then
+            pc="$label"
+        fi
+        ;;
+
+    B.NE) # Branch if not equal
+        label=$(echo "$args" | awk '{print $1}')
+        if [ "$FLAG_Z" = 0 ]; then
+            pc="$label"
+        fi
+        ;;
+    MOVEK) # MOVEK rX IMM SHIFT
+        r=$(echo "$args" | awk '{print $1}')
+        imm=$(echo "$args" | awk '{print $2}')
+        shift=$(echo "$args" | awk '{print $3}')
+        old=$(getreg "$r")
+        mask=$((~(0xFFFF << shift)))
+        val=$(( (old & mask) | (imm << shift) ))
+        setreg "$r" "$val"
+        ;;
+    ADRP) # ADRP rDST ADDR
+        r=$(echo "$args" | awk '{print $1}')
+        addr=$(echo "$args" | awk '{print $2}')
+        page=$(( addr & 0xFFFFFFFFFFFFF000 ))
+        setreg "$r" "$page"
+        ;;
+       return)
+       exit 0
+        ;;
+        OEM_UNLCK)
+        val=$(echo "$line" | awk '{print $2}')
+        echo "[OEM_UNLCK]: OEM unlock flag set to $val"
+        ;;
+
+    DM_VERITY)
+        val=$(echo "$line" | awk '{print $2}')
+        echo "[DM_VERITY]: dm-verity state set to $val"
+        ;;
+        MOVE)
+            dest=$(echo "$2" | tr -d ','); src="$3"
+            val=$(getval "$src")
+            setreg "$dest" "$val"
+            ;;
+        ADD|SUB|MUL|DIV|AND|OR|XOR)
+            dest=$(echo "$2" | tr -d ','); a=$(echo "$3" | tr -d ','); b="$4"
+            va=$(getval "$a"); vb=$(getval "$b")
+            case "$instr" in
+                ADD) res=$((va + vb));;
+                SUB) res=$((va - vb));;
+                MUL) res=$((va * vb));;
+                DIV) [ "$vb" -ne 0 ] && res=$((va / vb)) || res=0;;
+                AND) res=$((va & vb));;
+                OR)  res=$((va | vb));;
+                XOR) res=$((va ^ vb));;
+            esac
+            setreg "$dest" "$res"
+            ;;
+        NOT)
+            dest=$(echo "$2" | tr -d ','); src="$3"
+            va=$(getval "$src"); res=$((~va))
+            setreg "$dest" "$res"
+            ;;
+       CLREX)
+        echo "[CLREX]: clear exclusive monitor"
+        ;;
+
+    LDAXR)
+        reg=$(echo "$line" | awk '{print $2}')
+        addr=$(echo "$line" | awk '{print $3}')
+        echo "[LDAXR]: load‑acquire exclusive from $addr into $reg"
+        ;;
+     UNLCK)
+        val=$(echo "$line" | awk '{print $2}')
+        if [ "$val" -eq 1 ]; then
+        echo "warning bootloader is unlocked, your balkava vm altered and voided waranty"
+        else
+        echo " "
+        fi
+        ;;
+        AVB)
+        val=$(echo "$line" | awk '{print $2}')
+        if [ "$val" -eq 1 ]; then
+            echo "[AVB]: Android Verified Boot enabled"
+        else
+            echo "[AVB]: AVB disabled"
+        fi
+        ;;
+
+    BYPASS_AVB)
+        val=$(echo "$line" | awk '{print $2}')
+        if [ "$val" -eq 1 ]; then
+            echo "⚠️  AVB BYPASS ACTIVE: booting even with invalid vbmeta"
+        else
+            echo "[BYPASS_AVB]: bypass disabled"
+        fi
+        ;;
+    UNLCK_CRITPAR)
+        val=$(echo "$line" | awk '{print $2}')
+        if [ "$val" -eq 1 ]; then
+        echo "warning: critical partition are unlock and altered"
+        else
+        echo " "
+        fi
+        ;;
+    STLXR)
+        reg=$(echo "$line" | awk '{print $2}')
+        addr=$(echo "$line" | awk '{print $3}')
+        echo "[STLXR]: store‑release exclusive $reg to $addr"
+        ;;
+       DC)
+    subop=$(echo "$line" | awk '{print $2}')
+    case "$subop" in
+      CIVAC)
+        addr=$(echo "$line" | awk '{print $3}')
+        echo "[DC CIVAC]: clean & invalidate data cache line VA=$addr"
+        ;;
+      ZVA)
+        addr=$(echo "$line" | awk '{print $3}')
+        echo "[DC ZVA]: zero data cache line VA=$addr"
+        ;;
+    esac
+    ;;
+IC)
+    subop=$(echo "$line" | awk '{print $2}')
+    case "$subop" in
+      IALLU)
+        echo "[IC IALLU]: invalidate all instruction caches to PoU"
+        ;;
+      IVAU)
+        addr=$(echo "$line" | awk '{print $3}')
+        echo "[IC IVAU]: invalidate instruction cache line VA=$addr"
+        ;;
+    esac
+    ;;
+TLBI)
+    subop=$(echo "$line" | awk '{print $2}')
+    case "$subop" in
+      VMALLE1)
+        echo "[TLBI VMALLE1]: invalidate all stage 1 translations EL1"
+        ;;
+    esac
+    ;;
+        SQRT)
+        reg=$(echo "$line" | awk '{print $2}')
+        echo "[SQRT]: square root into $reg"
+        ;;
+
+    ABS)
+        reg=$(echo "$line" | awk '{print $2}')
+        echo "[ABS]: absolute value of $reg"
+        ;;
+LDAXP)
+        reg1=$(echo "$line" | awk '{print $2}')
+        reg2=$(echo "$line" | awk '{print $3}')
+        addr=$(echo "$line" | awk '{print $4}')
+        echo "[LDAXP]: load-acquire exclusive pair from $addr into $reg1, $reg2"
+        ;;
+
+    STLXP)
+        reg1=$(echo "$line" | awk '{print $2}')
+        reg2=$(echo "$line" | awk '{print $3}')
+        addr=$(echo "$line" | awk '{print $4}')
+        echo "[STLXP]: store-release exclusive pair $reg1, $reg2 to $addr"
+        ;;
+DMB\ SY)
+        echo "[DMB SY]: data memory barrier, shareable domain"
+        ;;
+
+    DSB\ SY)
+        echo "[DSB SY]: data synchronization barrier, shareable domain"
+        ;;
+
+    ISB)
+        echo "[ISB]: instruction synchronization barrier"
+        ;;
+        FMADD)
+        regd=$(echo "$line" | awk '{print $2}')
+        regn=$(echo "$line" | awk '{print $3}')
+        regm=$(echo "$line" | awk '{print $4}')
+        rega=$(echo "$line" | awk '{print $5}')
+        echo "[FMADD]: fused multiply-add $regn * $regm + $rega → $regd"
+        ;;
+
+    FMSUB)
+        regd=$(echo "$line" | awk '{print $2}')
+        regn=$(echo "$line" | awk '{print $3}')
+        regm=$(echo "$line" | awk '{print $4}')
+        rega=$(echo "$line" | awk '{print $5}')
+        echo "[FMSUB]: fused multiply-sub $regn * $regm - $rega → $regd"
+        ;;
+
+    FCVT)
+        regd=$(echo "$line" | awk '{print $2}')
+        regn=$(echo "$line" | awk '{print $3}')
+        echo "[FCVT]: convert float $regn → int $regd"
+        ;;
+
+    RBIT)
+        reg=$(echo "$line" | awk '{print $2}')
+        echo "[RBIT]: reverse bits in $reg"
+        ;;
+
+    REV)
+        reg=$(echo "$line" | awk '{print $2}')
+        echo "[REV]: reverse byte order in $reg"
+        ;;
+
+    CLZ)
+        reg=$(echo "$line" | awk '{print $2}')
+        echo "[CLZ]: count leading zeros in $reg"
+        ;;
+
+    AESENC)
+        reg=$(echo "$line" | awk '{print $2}')
+        round=$(echo "$line" | awk '{print $3}')
+        echo "[AESENC]: AES encrypt $reg with round $round"
+        ;;
+
+    AESDEC)
+        reg=$(echo "$line" | awk '{print $2}')
+        round=$(echo "$line" | awk '{print $3}')
+        echo "[AESDEC]: AES decrypt $reg with round $round"
+        ;;
+
+    SHA1C)
+        reg=$(echo "$line" | awk '{print $2}')
+        echo "[SHA1C]: compute SHA1 cycle with $reg"
+        ;;
+        SHL|SHR)
+            dest=$(echo "$2" | tr -d ','); a=$(echo "$3" | tr -d ','); b="$4"
+            va=$(getval "$a"); vb=$(getval "$b")
+            case "$instr" in
+                SHL) res=$((va << vb));;
+                SHR) res=$((va >> vb));;
+            esac
+            setreg "$dest" "$res"
+            ;;
+        CMP)
+            a=$(echo "$2" | tr -d ','); b="$3"
+            va=$(getval "$a"); vb=$(getval "$b")
+            if [ "$va" -eq "$vb" ]; then last_cmp=0
+            elif [ "$va" -lt "$vb" ]; then last_cmp=-1
+            else last_cmp=1; fi
+            ;;
+        JE|JNE|JL|JG|JLE|JGE|JMP|CALL)
+            label=$2
+            jump=0
+            case "$instr" in
+                JMP) jump=1;;
+                CALL) jump=1; echo "$pc" >> "$stack_file";;
+                JE)  [ "$last_cmp" -eq 0 ] && jump=1;;
+                JNE) [ "$last_cmp" -ne 0 ] && jump=1;;
+                JL)  [ "$last_cmp" -eq -1 ] && jump=1;;
+                JG)  [ "$last_cmp" -eq 1 ] && jump=1;;
+                JLE) [ "$last_cmp" -eq -1 ] || [ "$last_cmp" -eq 0 ] && jump=1;;
+                JGE) [ "$last_cmp" -eq 1 ] || [ "$last_cmp" -eq 0 ] && jump=1;;
+            esac
+            if [ $jump -eq 1 ]; then
+                pc=$(( $(eval echo "\$label_$label") + 1 ))
+                last_jump=1
+            else
+                last_jump=0
+            fi
+            ;;
+#----------- hardware level things------------------
+    KEYBOARDINT) 
+    keyboard_interrupt 
+        ;;
+    TIMERINT) 
+    timer_interrupt 
+        ;;
+    DISKERRCHECK*) 
+    disk_error_check $(echo "$line" | awk '{print $2}') 
+        ;;  
+    RANDOMHWEVENT) 
+    random_hardware_event 
+        ;;
+    READPORT*)
+        port=$(echo "$line" | awk '{print $2}')
+        AL=$(readport "$port")
+        ;;
+    WRITEPORT*)
+        port=$(echo "$line" | awk '{print $2}')
+        val=$(echo "$line" | awk '{print $3}')
+        writeport "$port" "$val"
+        ;;
+    POLLSTATUS*)
+        port=$(echo "$line" | awk '{print $2}')
+        pollstatus "$port"
+        ;;
+    READDISK*)
+        sector=$(echo "$line" | awk '{print $2}')
+        AL=$(readdisk "$sector")
+        ;;
+    WRITEDISK*)
+        sector=$(echo "$line" | awk '{print $2}')
+        val=$(echo "$line" | awk '{print $3}')
+        writedisk "$sector" "$val"
+        ;;
+    READCMOS*)
+        reg=$(echo "$line" | awk '{print $2}')
+        AL=$(readcmos "$reg")
+        ;;
+    WRITECMOS*)
+        reg=$(echo "$line" | awk '{print $2}')
+        val=$(echo "$line" | awk '{print $3}')
+        writecmos "$reg" "$val"
+        ;;
+    READTIMER*)
+        AL=$(readtimer)
+        ;;
+    SLEEPMS*)
+        ms=$(echo "$line" | awk '{print $2}')
+        sleep "$ms"
+        ;;
+    STARTDMA*) 
+    STARTDMA $(echo "$line" | awk '{print $2}') $(echo "$line" | awk '{print $3}') $(echo "$line" | awk '{print $4}') 
+        ;;
+    STOPDMA*) 
+    STOPDMA 
+        ;;
+    MOUSEEVENT*) 
+    MOUSEEVENT 
+        ;;
+    PLAYSOUND*) 
+    PLAYSOUND $(echo "$line" | awk '{print $2}') $(echo "$line" | awk '{print $3}') 
+        ;;
+    SETTIMER*) SETTIMER $(echo "$line" | awk '{print $2}') $(echo "$line" | awk '{print $3}') 
+        ;;
+    STOPTIMER*) 
+    STOPTIMER $(echo "$line" | awk '{print $2}') 
+        ;;
+    SENDPACKET*) 
+    SENDPACKET $(echo "$line" | awk '{print $2}') $(echo "$line" | awk '{print $3}') $(echo "$line" | awk '{print $4}') 
+        ;;
+    RECEIVEPACKET*) 
+    RECEIVEPACKET $(echo "$line" | awk '{print $2}') $(echo "$line" | awk '{print $3}')
+        ;;
+    READMEM*)
+    AL=$(READMEM $(echo "$line" | awk '{print $2}')) 
+        ;;
+    WRITEMEM*) 
+    WRITEMEM $(echo "$line" | awk '{print $2}') $(echo "$line" | awk '{print $3}') 
+        ;;
+    SETFLAG*)
+    SETFLAG $(echo "$line" | awk '{print $2}') 
+        ;;
+    CLEARFLAG*)
+    CLEARFLAG $(echo "$line" | awk '{print $2}') 
+        ;;
+    TRIGGERINT*) 
+    TRIGGERINT $(echo "$line" | awk '{print $2}') 
+        ;;
+    READRTC*) 
+    AL=$(READRTC) 
+        ;;
+    WRITERTC*) 
+    WRITERTC $(echo "$line" | awk '{print $2}') 
+        ;;
+    WRITEVIDEO*) 
+    WRITEVIDEO $(echo "$line" | awk '{print $2}') $(echo "$line" | awk '{print $3}') 
+        ;;
+    READVIDEO*) 
+    AL=$(READVIDEO $(echo "$line" | awk '{print $2}'))
+        ;;
+  IOMMU_CREATE_DOMAIN)
+    name="$(kv NAME "$argstr")"
+    pg="$(kv PGSIZE "$argstr")"
+    [ -z "$name" ] && { echo "ERR: NAME"; break; }
+    [ -z "$pg" ]   && pg=4096
+    iommu_create_domain "$name" "$pg"
+    ;;
+
+  IOMMU_DESTROY_DOMAIN)
+    iommu_destroy_domain "$(kv NAME "$argstr")"
+    ;;
+
+  IOMMU_ATTACH_DEVICE)
+    iommu_attach_dev "$(kv DEV "$argstr")" "$(kv DOMAIN "$argstr")"
+    ;;
+
+  IOMMU_DETACH_DEVICE)
+    iommu_detach_dev "$(kv DEV "$argstr")"
+    ;;
+
+  IOMMU_MAP)
+    dom="$(kv DOMAIN "$argstr")"
+    iova="$(hexnorm "$(kv IOVA "$argstr")")"
+    phys="$(hexnorm "$(kv PHYS "$argstr")")"
+    size="$(_dec "$(kv SIZE "$argstr")")"
+    perm="$(kv PERM "$argstr")"
+    iommu_map "$dom" "$iova" "$phys" "$size" "$perm"
+    ;;
+
+  IOMMU_UNMAP)
+    dom="$(kv DOMAIN "$argstr")"
+    iova="$(hexnorm "$(kv IOVA "$argstr")")"
+    size="$(_dec "$(kv SIZE "$argstr")")"
+    iommu_unmap "$dom" "$iova" "$size"
+    ;;
+
+  IOMMU_TRANSLATE)
+    dom="$(kv DOMAIN "$argstr")"
+    iova="$(hexnorm "$(kv IOVA "$argstr")")"
+    iommu_translate "$dom" "$iova"
+    ;;
+
+  IOMMU_DMA)
+    dev="$(kv DEV "$argstr")"
+    dir="$(kv DIR "$argstr")"
+    iova="$(hexnorm "$(kv IOVA "$argstr")")"
+    size="$(_dec "$(kv SIZE "$argstr")")"
+    iommu_dma "$dev" "$dir" "$iova" "$size"
+    ;;
+    IOMMU_STATS)
+        domain=$(echo "$ARGS" | awk -F= '/DOMAIN/ {print $2}')
+        iommu_stats "$domain"
+        ;;
+    VFS_MOUNT)
+        src=$(echo "$ARGS" | awk -F= '/SRC/ {print $2}')
+        type=$(echo "$ARGS" | awk -F= '/TYPE/ {print $2}')
+        mnt=$(echo "$ARGS" | awk -F= '/MNT/ {print $2}')
+        vfs_mount "$src" "$type" "$mnt"
+        ;;
+    SCHED_CREATE)
+        pid=$(echo "$ARGS" | awk -F= '/PID/ {print $2}')
+        name=$(echo "$ARGS" | awk -F= '/NAME/ {print $2}')
+        pri=$(echo "$ARGS" | awk -F= '/PRI/ {print $2}')
+        sched_create "$pid" "$name" "$pri"
+        ;;
+       # Timers
+    TIMER_CREATE)
+        timer_create "$(get_arg ID "$@")" "$(get_arg MS "$@")" "$(get_arg CALLBACK "$@")"
+        ;;
+    TIMER_CANCEL)
+        timer_cancel "$(get_arg ID "$@")"
+        ;;
+    TIMER_LIST)
+        timer_list
+        ;;
+
+    # IPC
+    IPC_SEND)
+        ipc_send "$(get_arg Q "$@")" "$(get_arg FROM "$@")" "$(get_arg MSG "$@")"
+        ;;
+    IPC_RECV)
+        ipc_recv "$(get_arg Q "$@")"
+        ;;
+
+    # Device power
+    DEV_POWER)
+        dev_power "$(get_arg DEV "$@")" "$(get_arg ACTION "$@")"
+        ;;
+
+    # Page table safe mapping
+    PT_MAP_SAFE)
+        pt_map_safe "$(get_arg PID "$@")" "$(get_arg VADDR "$@")" "$(get_arg PADDR "$@")" "$(get_arg SIZE "$@")"
+        ;;
+
+    # Fault injector
+    FAULT_INJECT)
+        fault_inject "$(get_arg TARGET "$@")" "$(get_arg TYPE "$@")" "$(get_arg PROB "$@")"
+        ;;
+    FAULT_STATUS)
+        fault_status "$(get_arg TARGET "$@")"
+        ;;
+    DMA_ALLOC) dma_alloc "$(get_arg ID "$@")" "$(get_arg SIZE "$@")" ;;
+    DMA_FREE) dma_free "$(get_arg ID "$@")" ;;
+
+    NUMA_ADD_NODE) numa_add_node "$(get_arg ID "$@")" "$(get_arg CPUS "$@")" ;;
+    NUMA_LIST_NODES) numa_list_nodes ;;
+
+    CGROUP_CREATE) cgroup_create "$(get_arg NAME "$@")" ;;
+    CGROUP_ADD_TASK) cgroup_add_task "$(get_arg NAME "$@")" "$(get_arg PID "$@")" ;;
+    CGROUP_LIST) cgroup_list ;;
+
+    KLOG_WRITE) klog_write "$(get_arg MSG "$@")" ;;
+    KLOG_READ) klog_read ;;
+
+    PAGE_ALLOC) page_alloc "$(get_arg ID "$@")" "$(get_arg COUNT "$@")" ;;
+    PAGE_FREE) page_free "$(get_arg ID "$@")" ;;
+
+    TIMER_SET) timer_set "$(get_arg ID "$@")" "$(get_arg MS "$@")" ;;
+    TIMER_GET) timer_get "$(get_arg ID "$@")" ;;
+    PERF_START) perf_start "$(get_arg NAME "$@")" ;;
+    PERF_STOP) perf_stop "$(get_arg NAME "$@")" ;;
+    PERF_READ) perf_read "$(get_arg NAME "$@")" ;;
+
+    WATCHDOG_SET) watchdog_set "$(get_arg ID "$@")" "$(get_arg MS "$@")" ;;
+    WATCHDOG_KICK) watchdog_kick "$(get_arg ID "$@")" ;;
+    WATCHDOG_STATUS) watchdog_status "$(get_arg ID "$@")" ;;
+
+    FW_LOAD) fw_load "$(get_arg DEV "$@")" "$(get_arg FILE "$@")" ;;
+    FW_UNLOAD) fw_unload "$(get_arg DEV "$@")" ;;
+    FW_LIST) fw_list ;;
+
+    CPUFREQ_SET) cpufreq_set "$(get_arg CPU "$@")" "$(get_arg GOV "$@")" "$(get_arg FREQ "$@")" ;;
+    CPUFREQ_GET) cpufreq_get "$(get_arg CPU "$@")" ;;
+
+    ENTROPY_SEED) entropy_seed "$(get_arg NAME "$@")" "$(get_arg DATA "$@")" ;;
+    ENTROPY_READ) entropy_read "$(get_arg SIZE "$@")" ;;
+
+    SWAP_SET) swap_set_swappiness "$(get_arg V "$@")" ;;
+    SWAP_SHOW) swap_show ;;
+
+    SECCOMP_ALLOW) seccomp_allow "$(get_arg SYSCALL "$@")" ;;
+    SECCOMP_DENY) seccomp_deny "$(get_arg SYSCALL "$@")" ;;
+    SECCOMP_LIST) seccomp_list ;;
+
+    AUDIT_LOG) audit_log "$(get_arg WHO "$@")" "$(get_arg WHAT "$@")" ;;
+    AUDIT_QUERY) audit_query "$(get_arg PAT "$@")" ;;
+
+    HOTPLUG_ATTACH) hotplug_attach "$(get_arg DEV "$@")" ;;
+    HOTPLUG_DETACH) hotplug_detach "$(get_arg DEV "$@")" ;;
+    HOTPLUG_LIST) hotplug_list ;;
+
+    MODPARAM_SET) modparam_set "$(get_arg MOD "$@")" "$(get_arg PARAM "$@")" "$(get_arg VAL "$@")" ;;
+    MODPARAM_GET) modparam_get "$(get_arg MOD "$@")" "$(get_arg PARAM "$@")" ;;
+
+    NS_CREATE) ns_create "$(get_arg NAME "$@")" ;;
+    NS_LIST) ns_list ;;
+    NS_ENTER) ns_enter "$(get_arg NAME "$@")" ;;
+
+    EBPF_LOAD) ebpf_load "$(get_arg ID "$@")" "$(get_arg CODE "$@")" ;;
+    EBPF_UNLOAD) ebpf_unload "$(get_arg ID "$@")" ;;
+    EBPF_RUN) ebpf_run "$(get_arg ID "$@")" ;;
+
+    PANIC_DUMP) panic_dump ;;
+
+    CPU_OFFLINE) cpu_offline "$(get_arg ID "$@")" ;;
+    CPU_ONLINE) cpu_online "$(get_arg ID "$@")" ;;
+    CPU_STATUS) cpu_status "$(get_arg ID "$@")" ;;
+
+    RING_WRITE) ring_write "$(get_arg MSG "$@")" ;;
+    RING_READ) ring_read "$(get_arg LINES "$@")" ;;
+    # TLB cache
+    TLB_PUT) tlb_put "$(get_arg KEY "$@")" "$(get_arg PHYS "$@")" ;;
+    TLB_GET) tlb_get "$(get_arg KEY "$@")" ;;
+    TLB_INVALIDATE) tlb_invalidate "$(get_arg KEY "$@")" ;;
+    TLB_FLUSH) tlb_flush ;;
+
+    # Coherent DMA
+    COHERENT_ALLOC) coherent_alloc "$(get_arg ID "$@")" "$(get_arg SIZE "$@")" ;;
+    COHERENT_FREE) coherent_free "$(get_arg ID "$@")" ;;
+    COHERENT_SYNC_CPU_TO_DEV) coherent_sync_cpu_to_dev "$(get_arg ID "$@")" ;;
+    COHERENT_SYNC_DEV_TO_CPU) coherent_sync_dev_to_cpu "$(get_arg ID "$@")" ;;
+
+    # Swap reclaim
+    SWAP_RECLAIM) swap_reclaim "$(get_arg PAGES "$@")" ;;
+
+    # /proc
+    PROC_WRITE) proc_write "$(get_arg PATH "$@")" "$(get_arg DATA "$@")" ;;
+    PROC_READ) proc_read "$(get_arg PATH "$@")" ;;
+    PROC_LIST) proc_list ;;
+
+    # Syscall injector
+    SYSCALL_INJECT) syscall_inject "$(get_arg PID "$@")" "$(get_arg NAME "$@")" "$(get_arg ARGS "$@")" ;;
+
+    # Gov / userspace
+    GOV_SET) gov_set "$(get_arg CPU "$@")" "$(get_arg GOV "$@")" "$(get_arg FREQ "$@")" ;;
+    GOV_GET) gov_get "$(get_arg CPU "$@")" ;;
+    USR_LOAD) userspace_load "$(get_arg PID "$@")" "$(get_arg FILE "$@")" ;;
+    USR_RUN) userspace_run "$(get_arg PID "$@")" ;;
+
+    # Scheduler balancer
+    SCHED_MOVE) sched_balance_move "$(get_arg PID "$@")" "$(get_arg CPU "$@")" ;;
+    SCHED_SHOW) sched_balance_show ;;
+
+    # cgroupv2 & OOM
+    CGV2_CREATE) cgroupv2_create "$(get_arg NAME "$@")" ;;
+    CGV2_SET_MEM) cgroupv2_set_limit "$(get_arg NAME "$@")" "$(get_arg MEM "$@")" ;;
+    CGV2_LIST) cgroupv2_list ;;
+    OOM_KILL) oom_kill ;;
+
+    # Pager
+    PAGER_SET_BACKING) pager_set_backing "$(get_arg PID "$@")" "$(get_arg PAGEID "$@")" "$(get_arg FILE "$@")" ;;
+    PAGER_FAULT) pager_handle_fault "$(get_arg PID "$@")" "$(get_arg PAGEID "$@")" ;;
+
+    # Softirq
+    SOFTIRQ_RAISE) softirq_raise "$(get_arg ID "$@")" ;;
+    SOFTIRQ_RUN) softirq_run ;;
+
+    # Device mapper & overlay
+    DM_ADD) dm_table_add "$(get_arg NAME "$@")" "$(get_arg DEVS "$@")" ;;
+    DM_GET) dm_table_get "$(get_arg NAME "$@")" ;;
+    DM_SNAP) dm_snapshot "$(get_arg NAME "$@")" "$(get_arg SNAP "$@")" ;;
+    OVERLAY_MOUNT) overlay_mount "$(get_arg NAME "$@")" "$(get_arg LOWER "$@")" "$(get_arg UPPER "$@")" ;;
+    OVERLAY_LS) overlay_ls "$(get_arg NAME "$@")" ;;
+
+    # Checkpoint / restore
+    CKPT_CREATE) checkpoint_create "$(get_arg PID "$@")" "$(get_arg NAME "$@")" ;;
+    CKPT_RESTORE) checkpoint_restore "$(get_arg NAME "$@")" ;;
+
+    # Modules & boot params
+    MOD_LIST) mod_list ;;
+    MOD_SYMS) mod_symbols "$(get_arg MOD "$@")" ;;
+    BOOT_SET) bootparam_set "$(get_arg KEY "$@")" "$(get_arg VAL "$@")" ;;
+    BOOT_GET) bootparam_get "$(get_arg KEY "$@")" ;;
+     PRINT*) payload="${line#PRINT }"; last="$(printf '%s' "$payload" | awk '{print $NF}')"
+            case "$last" in [0-9]*) color="$last"; payload="$(printf '%s' "$payload" | sed -e "s/ [0-9]\+$//")" ;; *) color=32 ;; esac
+            PRINT "$payload" "$color" ;;
+        PCI_SCAN*) PCI_SCAN ;;
+        PCI_READ*) PCI_READ "$(printf '%s' "$line" | sed 's/^PCI_READ //')" ;;
+        PCI_WRITE*) PCI_WRITE "$(printf '%s' "$line" | sed 's/^PCI_WRITE //')" ;;
+        RTC_READ*) RTC_READ ;;
+        RTC_SET*) RTC_SET "$(printf '%s' "$line" | sed 's/^RTC_SET //')" ;;
+        GPIO_SET*) GPIO_SET "$(printf '%s' "$line" | sed 's/^GPIO_SET //')" ;;
+        GPIO_GET*) GPIO_GET "$(printf '%s' "$line" | sed 's/^GPIO_GET //')" ;;
+        GPIO_MODE*) GPIO_MODE "$(printf '%s' "$line" | sed 's/^GPIO_MODE //')" ;;
+        I2C_SCAN*) I2C_SCAN "$(printf '%s' "$line" | sed 's/^I2C_SCAN //')" ;;
+        I2C_READ*) I2C_READ "$(printf '%s' "$line" | sed 's/^I2C_READ //')" ;;
+        I2C_WRITE*) I2C_WRITE "$(printf '%s' "$line" | sed 's/^I2C_WRITE //')" ;;
+        SPI_XFER*) SPI_XFER "$(printf '%s' "$line" | sed 's/^SPI_XFER //')" ;;
+        ADC_READ*) ADC_READ "$(printf '%s' "$line" | sed 's/^ADC_READ //')" ;;
+        DAC_WRITE*) DAC_WRITE "$(printf '%s' "$line" | sed 's/^DAC_WRITE //')" ;;
+        PWM_SET*) PWM_SET "$(printf '%s' "$line" | sed 's/^PWM_SET //')" ;;
+        TEMP_READ*) TEMP_READ "$(printf '%s' "$line" | sed 's/^TEMP_READ //')" ;;
+        FAN_SET*) FAN_SET "$(printf '%s' "$line" | sed 's/^FAN_SET //')" ;;
+        FAN_GET*) FAN_GET ;;
+        FB_INIT*) FB_INIT "$(printf '%s' "$line" | sed 's/^FB_INIT //')" ;;
+        FB_PUTPIXEL*) FB_PUTPIXEL "$(printf '%s' "$line" | sed 's/^FB_PUTPIXEL //')" ;;
+        FB_FILLRECT*) FB_FILLRECT "$(printf '%s' "$line" | sed 's/^FB_FILLRECT //')" ;;
+        FB_SWAPBUF*) FB_SWAPBUF ;;
+        AUDIO_INIT*) AUDIO_INIT "$(printf '%s' "$line" | sed 's/^AUDIO_INIT //')" ;;
+        AUDIO_PLAY*) AUDIO_PLAY "$(printf '%s' "$line" | sed 's/^AUDIO_PLAY //')" ;;
+        AUDIO_STOP*) AUDIO_STOP ;;
+        BAT_STATUS*) BAT_STATUS ;;
+        BAT_LEVEL*) BAT_LEVEL ;;
+        BAT_CHARGE*) BAT_CHARGE "$(printf '%s' "$line" | sed 's/^BAT_CHARGE //')" ;;
+        RNG_HW*) RNG_HW "$(printf '%s' "$line" | sed 's/^RNG_HW //')" ;;
+        KB_READ*) KB_READ ;;
+        KB_LED*) KB_LED "$(printf '%s' "$line" | sed 's/^KB_LED //')" ;;
+        SENDPACKET*) SENDPACKET "$(printf '%s' "$line" | sed 's/^SENDPACKET //')" ;;
+        RECEIVEPACKET*) RECEIVEPACKET "$(printf '%s' "$line" | sed 's/^RECEIVEPACKET //')" ;;
+        KLOG_WRITE*) KLOG_WRITE "$(printf '%s' "$line" | sed 's/^KLOG_WRITE //')" ;;
+        KLOG_READ*) KLOG_READ ;; 
+        IRQ_REGISTER*) IRQ_REGISTER "$(printf '%s' "$line" | sed 's/^IRQ_REGISTER //')" ;;
+        IRQ_UNREGISTER*) IRQ_UNREGISTER "$(printf '%s' "$line" | sed 's/^IRQ_UNREGISTER //')" ;;
+        IRQ_LIST*) IRQ_LIST ;;
+        IRQ_TRIGGER*) IRQ_TRIGGER "$(printf '%s' "$line" | sed 's/^IRQ_TRIGGER //')" ;;
+        
+
+# Hypervisor madness
+hv_MEM_ALLOC*) 
+    VMID=$(echo "$line" | cut -d' ' -f2)
+    SIZE=$(echo "$line" | cut -d' ' -f3)
+    UARTPRINT "[HV] Allocating $SIZE for VM $VMID" 31
+    ;;
+HV_MEM_FREE*) 
+    VMID=$(echo "$line" | cut -d' ' -f2)
+    SIZE=$(echo "$line" | cut -d' ' -f3)
+    UARTPRINT "[HV] Freeing $SIZE memory from VM $VMID" 31
+    ;;
+HV_IRQ_INJECT*) 
+    VMID=$(echo "$line" | cut -d' ' -f2)
+    IRQ=$(echo "$line" | cut -d' ' -f3)
+    UARTPRINT "[HV] Inject IRQ $IRQ to VM $VMID" 33
+    ;;
+HV_IO_MAP*) 
+    VMID=$(echo "$line" | cut -d' ' -f2)
+    PHYS=$(echo "$line" | cut -d' ' -f3)
+    VIRT=$(echo "$line" | cut -d' ' -f4)
+    SIZE=$(echo "$line" | cut -d' ' -f5)
+    UARTPRINT "[HV] Mapping I/O PHYS=$PHYS -> VIRT=$VIRT SIZE=$SIZE for VM $VMID" 32
+    ;;
+HV_VM_RESET*) 
+    VMID=$(echo "$line" | cut -d' ' -f2)
+    UARTPRINT "[HV] Resetting VM $VMID" 32
+    ;;
+
+# Bootloader madness
+BL_CHECK_SIG*) 
+    FILE=$(echo "$line" | cut -d' ' -f2)
+    UARTPRINT "[BL] Checking signature of $FILE" 36
+    ;;
+BL_LOAD_FIRMWARE*) 
+    DEV=$(echo "$line" | cut -d' ' -f2)
+    FILE=$(echo "$line" | cut -d' ' -f3)
+    UARTPRINT "[BL] Loading firmware $FILE into $DEV" 36
+    ;;
+BL_SET_ENV*) 
+    KEY=$(echo "$line" | cut -d' ' -f2)
+    VAL=$(echo "$line" | cut -d' ' -f3)
+    UARTPRINT "[BL] Setting bootloader env $KEY=$VAL" 36
+    ;;
+BL_RESET_HW*) 
+    UARTPRINT "[BL] Performing hardware reset" 36
+    ;;
+BL_BOOT_VM*) 
+    VMID=$(echo "$line" | cut -d' ' -f2)
+    UARTPRINT "[BL] Booting VM $VMID" 36
+    ;;
+LOAD_MODULE*)
+    MOD=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL] Loading module $MOD from /data/local/tmp/balkava_a/boot"
+    ;;
+UNLOAD_MODULE*)
+    MOD=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL] Unloading module $MOD"
+    ;;
+DRIVER_LOAD*)
+    DEV=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL] Loading driver for $DEV"
+    ;;
+DRIVER_UNLOAD*)
+    DEV=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL] Unloading driver for $DEV"
+    ;;
+# Low-level chaos
+MMU_ENABLE*) 
+    echo "[LL] MMU enabled" 35
+    ;;
+MMU_DISABLE*) 
+    echo "[LL] MMU disabled" 35
+    ;;
+DMA_MAP*) 
+    DEV=$(echo "$line" | cut -d' ' -f2)
+    ADDR=$(echo "$line" | cut -d' ' -f3)
+    SIZE=$(echo "$line" | cut -d' ' -f4)
+    echo "[LL] DMA mapped: DEV=$DEV ADDR=$ADDR SIZE=$SIZE" 32
+    ;;
+TRACEPOINT_HIT*)
+    TP=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL TRACE] HIT $TP"
+    ;;
+NET_DROP*)
+    PKT=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL NET] DROPPED PKT=$PKT"
+    ;;
+NET_FORWARD*)
+    PKT=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL NET] FORWARDED PKT=$PKT"
+    ;;
+FPU_SAVE*)
+    PID=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL FPU] SAVED FPU STATE FOR PID=$PID"
+    ;;
+FPU_RESTORE*)
+    PID=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL FPU] RESTORED FPU STATE FOR PID=$PID"
+    ;;
+SCHED_CFS*)
+    PID=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL SCHED CFS] PID=$PID SCHEDULED"
+    ;;
+SCHED_RT*)
+    PID=$(echo "$line" | cut -d' ' -f2)
+    echo "[BKERNEL SCHED RT] PID=$PID REALTIME RUN"
+    ;;
+UEVENT*)
+    DEV=$(echo "$line" | cut -d' ' -f2)
+    ACTION=$(echo "$line" | cut -d' ' -f3)
+    echo "[BKERNEL UEVENT] DEVICE=$DEV ACTION=$ACTION"
+    ;;
+FB_INIT*)
+    W=$(echo "$line" | cut -d' ' -f2)
+    H=$(echo "$line" | cut -d' ' -f3)
+    BPP=$(echo "$line" | cut -d' ' -f4)
+    echo "[FB] INIT WIDTH=$W HEIGHT=$H BPP=$BPP"
+    touch /data/local/tmp/balkava_a/dev/fb0
+    ;;
+FB_PUTPIXEL*)
+    X=$(echo "$line" | cut -d' ' -f2)
+    Y=$(echo "$line" | cut -d' ' -f3)
+    COLOR=$(echo "$line" | cut -d' ' -f4)
+    echo "[FB] PUTPIXEL X=$X Y=$Y COLOR=$COLOR"
+    ;;
+FB_FILLRECT*)
+    X=$(echo "$line" | cut -d' ' -f2)
+    Y=$(echo "$line" | cut -d' ' -f3)
+    W=$(echo "$line" | cut -d' ' -f4)
+    H=$(echo "$line" | cut -d' ' -f5)
+    COLOR=$(echo "$line" | cut -d' ' -f6)
+    echo "[FB] FILLRECT X=$X Y=$Y W=$W H=$H COLOR=$COLOR"
+    ;;
+FB_SWAPBUF*)
+    echo "[FB] SWAP BUFFER"
+    ;;
+CKPT_CREATE*)
+    PID=$(echo "$line" | cut -d' ' -f2)
+    NAME=$(echo "$line" | cut -d' ' -f3)
+    echo "[CKPT] CREATE PID=$PID NAME=$NAME"
+    touch /data/local/tmp/balkava_a/proc/$PID
+    ;;
+CKPT_RESTORE*)
+    NAME=$(echo "$line" | cut -d' ' -f2)
+    echo "[CKPT] RESTORE NAME=$NAME"
+    ;;
+PREINIT_HOOK*) echo "[HOOK] PRE-INIT triggered";;
+POSTINIT_HOOK*) echo "[HOOK] POST-INIT triggered";;
+REINIT_HOOK*) echo "[HOOK] RE-INIT triggered";;
+#---------- end of hardware API functions ---------------
+        RET)
+            if [ -s "$stack_file" ]; then
+                pc=$(tail -n1 "$stack_file")
+                sed -i '$ d' "$stack_file"
+            else
+                running=0
+            fi
+            ;;
+        BPRINT|bprint)
+            text=$(echo "$line" | sed 's/^[^"]*"//;s/"$//')
+            echo "[BPRINT]: $text"
+            ;;
+          USLEEP)
+            val="$2"
+            if echo "$val" | grep -q '^#'; then
+                raw=${val#\#}
+                # interpret 05 as 0.5, 1 as 1
+                if echo "$raw" | grep -q '^0'; then
+                    t=".$(echo "$raw" | sed 's/^0*//')"
+                else
+                    t="$raw"
+                fi
+                sleep "$t"
+             fi
+             ;;
+        RAND)
+            dest=$(echo "$2" | tr -d ',')
+            max=$3
+            if echo "$max" | grep -q '^#'; then
+                m=${max#\#}
+            else
+                m=1
+            fi
+            r=$(od -An -N2 -tu2 /dev/urandom | tr -d ' ')
+            r=$(( r % m ))
+            setreg "$dest" "$r"
+            ;;
+       UARTPRINT)
+            c1=$2; c2=$3
+            text=$(printf "%s\n" "$line" | cut -d'"' -f2)
+            word1=$(printf "%s" "$text" | cut -d' ' -f1)
+            word2=$(printf "%s" "$text" | cut -d' ' -f2-)
+            code1=${c1#\#}; code2=${c2#\#}
+            # map color codes
+            color() {
+                case "$1" in
+                    0) echo "\033[37m";; # white
+                    1) echo "\033[31m";; # red
+                    2) echo "\033[32m";; # green
+                    3) echo "\033[35m";; # violet
+                    4) echo "\033[36m";; # cyan
+                    5) echo "\033[33m";; # yellow
+                    6) echo "\033[90m";; # gray
+                    7) echo "\033[34m";; # blue
+                    *) echo "\033[0m";;
+                esac
+            }
+            ccode1=$(color "$code1")
+            ccode2=$(color "$code2")
+            reset="\033[0m"
+            printf "%b%s %b%s%b\n" "$ccode1" "$word1" "$ccode2" "$word2" "$reset"
+            ;;
+KEXEC|LOAD)
+    filepath=$(echo "$line" | awk '{print $2}')
+    
+    # If filepath doesn't start with '/', add $PWD/
+    case "$filepath" in
+        /*) ;;  # absolute path, do nothing
+        *) filepath="$PWD/$filepath" ;;
+    esac
+
+    if [[ "$filepath" == *.basm ]]; then
+        echo "[KEXEC]: Detected .basm file"
+        /data/local/tmp/balkava_a/system/basmrun "$filepath"
+    else
+        chmod +x "$filepath"
+        "$filepath"
+    fi
+    ;;
+BL)
+            label=$2
+            echo "$pc" >> "$stack_file"
+            pc=$(( $(eval echo "\$label_$label") + 1 ))
+            ;;
+SVC)
+            num=$2
+            if echo "$num" | grep -q '^#'; then
+                svc_num=${num#\#}
+            else
+                svc_num=$num
+            fi
+            case "$svc_num" in
+                0)
+                    echo "SVC 0: Allocated: 0x9000"
+                    ;;
+                1)
+                    echo "SVC 1: Dumping registers"
+                    echo "=== Registers ==="
+                    for reg in r0 r1 r2 r3 r4 r5 r6 r7; do
+                        val=$(getreg "$reg")
+                        echo "$reg = $val"
+                    done
+                    ;;
+                2)
+                    echo "SVC 2: Halt"
+                    exit 0
+                    ;;
+                3) echo "SVC 3: MMIO: INITDDR RESET"
+                 ;;
+                 *)
+                    echo "Unknown SVC number: $svc_num"
+                    ;;
+            esac
+            ;;
+NOP)
+            # Do nothing
+            ;;
+        BEEP)
+            echo -e "\a"  # terminal bell
+            ;;
+        HLT)
+            echo "[HLT]: System halted"
+            exit 0
+            ;;
+        TIME)
+            reg=$2
+            timestamp=$(date +%s)
+            eval "$reg=$timestamp"
+            echo "[TIME]: Set $reg = $timestamp"
+            ;;
+        PANIC)
+            text=$(echo "$line" | cut -d' ' -f2-)
+            echo "[PANIC]: $text"
+            exit 1
+            ;;
+        LDR)
+            reg=$2
+            value=$3
+            if echo "$value" | grep -q '^#'; then
+                value=${value#\#}
+            fi
+            eval "$reg=$value"
+            echo "[LDR]: Loaded $value into $reg"
+            ;;
+        STR)
+    reg=$2
+    value=$(eval echo \$$reg)
+     echo "[STR]: Stored $value from $reg"
+    ;;
+PLLSET)
+    val=$(echo "$2" | sed 's/#//')
+    echo "[PLLSET]: set PLL freq to ${val}MHz"
+    ;;
+
+CLKEN)
+    name=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    echo "[CLKEN]: enabled clock $name"
+    ;;
+
+CLKDIS)
+    name=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    echo "[CLKDIS]: disabled clock $name"
+    ;;
+
+PINMUX)
+    func=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    echo "[PINMUX]: set pin multiplexer to $func"
+    ;;
+
+MMIOWR)
+    addr=$(echo "$3" | sed 's/#//')
+    val=$(echo "$4" | sed 's/#//')
+    echo "[MMIOWR]: wrote $val to $addr"
+    ;;
+
+MMIORD)
+    reg=$2
+    addr=$(echo "$3" | sed 's/#//')
+    fakeval=$(( ($RANDOM << 8) | ($RANDOM & 0xFF) ))
+    eval "$reg=$fakeval"
+    echo "[MMIORD]: read $fakeval from $addr into $reg"
+    ;;
+
+SECURECALL)
+    num=$(echo "$2" | sed 's/#//')
+    echo "[SECURECALL]: called secure monitor function #$num"
+    ;;
+
+TZSET)
+    val=$(echo "$2" | sed 's/#//')
+    echo "[TZSET]: set TrustZone state to $val"
+    ;;
+
+ELSET)
+    val=$(echo "$2" | sed 's/#//')
+    echo "[ELSET]: set exception level to EL$val"
+    ;;
+
+BOOTSTAGE)
+    num=$(echo "$2" | sed 's/#//')
+    echo "[BOOTSTAGE]: Stage $num"
+    ;;
+
+LOADDTB)
+    path=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    if [ -f $path ]; then
+    echo "[LOADDTB]: loaded device tree from $path"
+    echo "[IPI]: sent device tree update notification to core #1"
+    echo "[CHECK]: $path is compatible with Balkava v1.0+"
+    else
+    echo "ERROR: DTB NOT FOUND. HALTING"
+    exit 1
+    fi
+    ;;
+
+INITRAMFS)
+    path=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    echo "[INITRAMFS]: loaded initramfs from $path"
+    ;;
+
+DTBOAPPLY)
+    path=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    echo "[DTBOAPPLY]: applied DTBO overlay from $path"
+    ;;
+DTBOLOAD)
+    path=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    if [ -f $path ]; then
+    echo "[DTBOLOAD]: LOADED DTBO overlay from $path"
+    echo "[IPI]: sent device tree overlay update notification to core #1"
+    echo "[CHECK]: $path is compatible with Balkava v1.0+"
+    else
+    echo "ERROR: DTBO NOT FOUND. HALTING"
+    exit 1
+    fi
+    ;;
+DMASETUP)
+    chan=$(echo "$2" | sed 's/#//')
+    echo "[DMASETUP]: configured DMA channel $chan"
+    ;;
+
+DMASTART)
+    chan=$(echo "$2" | sed 's/#//')
+    echo "[DMASTART]: started DMA channel $chan"
+    ;;
+
+DMADONE)
+    chan=$(echo "$2" | sed 's/#//')
+    echo "[DMADONE]: completed DMA channel $chan"
+    ;;
+
+CACHEON)
+    echo "[CACHEON]: cache enabled"
+    ;;
+
+CACHEOFF)
+    echo "[CACHEOFF]: cache disabled"
+    ;;
+
+ICACHEFLUSH)
+    echo "[ICACHEFLUSH]: instruction cache flushed"
+    ;;
+
+DCACHEFLUSH)
+    echo "[DCACHEFLUSH]: data cache flushed"
+    ;;
+
+INVDTLB)
+    echo "[INVDTLB]: invalidated TLB"
+    ;;
+
+BOOTADDR)
+    addr=$(echo "$2" | sed 's/#//')
+    echo "[BOOTADDR]: set next boot address to $addr"
+    ;;
+
+PMUSET)
+    mode=$(echo "$2" | sed 's/#//')
+    echo "[PMUSET]: set power mode $mode"
+    ;;
+
+WATCHDOG)
+    val=$(echo "$2" | sed 's/#//')
+    echo "[WATCHDOG]: watchdog timer set to $val ms"
+    ;;
+
+JTAGENABLE)
+    echo "[JTAGENABLE]: JTAG debug enabled"
+    ;;
+
+JTAGDISABLE)
+    echo "[JTAGDISABLE]: JTAG debug disabled"
+    ;;
+
+TRACEON)
+    echo "[TRACEON]: hardware trace enabled"
+    ;;
+
+TRACEOFF)
+    echo "[TRACEOFF]: hardware trace disabled"
+    ;;
+
+READFUSE)
+    reg=$2
+    fakefuse=$(( ($RANDOM << 8) | ($RANDOM & 0xFF) ))
+    eval "$reg=$fakefuse"
+    echo "[READFUSE]: read eFuse into $reg = $fakefuse"
+    ;;
+
+WRITEFUSE)
+    addr=$(echo "$2" | sed 's/#//')
+    val=$(echo "$3" | sed 's/#//')
+    echo "[WRITEFUSE]: wrote value $val to eFuse at $addr"
+    ;;
+
+SCRAMBLERON)
+    echo "[SCRAMBLERON]: memory scrambler enabled"
+    ;;
+
+SCRAMBLEROFF)
+    echo "[SCRAMBLEROFF]: memory scrambler disabled"
+    ;;
+
+BOOTKEYCHECK)
+    echo "[BOOTKEYCHECK]: verifying boot keys (simulated)"
+    ;;
+
+MEASURE)
+    what=$(echo "$line" | cut -d' ' -f2-)
+    echo "[MEASURE]: measured $what"
+    ;;
+
+RNG)
+    reg=$2
+    randval=$(( ($RANDOM << 8) | ($RANDOM & 0xFF) ))
+    eval "$reg=$randval"
+    echo "[RNG]: generated random into $reg = $randval"
+    ;;
+
+UIDREAD)
+    reg=$2
+    uid=$(( ($RANDOM << 12) | ($RANDOM << 4) | ($RANDOM & 0xF) ))
+    eval "$reg=$uid"
+    echo "[UIDREAD]: read unique ID into $reg = $uid"
+    ;;
+
+VERBOSE)
+    echo "[VERBOSE]: verbose mode enabled"
+    ;;
+PLLLOCK)
+    echo "[PLLLOCK]: waiting PLL lock"
+    ;;
+
+PLLUNLOCK)
+    echo "[PLLUNLOCK]: force unlock PLL"
+    ;;
+
+FREQMEASURE)
+    clk=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    fakefreq=$(( 1000 + RANDOM % 500 ))
+    echo "[FREQMEASURE]: $clk running at ${fakefreq}MHz"
+    ;;
+
+TEMPREAD)
+    reg=$2
+    faketemp=$(( 30 + RANDOM % 50 ))
+    eval "$reg=$faketemp"
+    echo "[TEMPREAD]: read SoC temp into $reg = $faketemp°C"
+    ;;
+
+THERMALTHROTTLE)
+    level=$(echo "$2" | sed 's/#//')
+    echo "[THERMALTHROTTLE]: applied thermal throttle level $level"
+    ;;
+
+PADCONFIG)
+    pin=$(echo "$2" | sed 's/#//')
+    cfg=$(echo "$3" | sed 's/#//')
+    echo "[PADCONFIG]: set pad $pin config $cfg"
+    ;;
+
+DRAMPARAM)
+    name=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    echo "[DRAMPARAM]: applied DRAM param: $name"
+    ;;
+
+DRAMTRAIN)
+    echo "[DRAMTRAIN]: running DRAM training"
+    ;;
+
+DRAMINIT)
+    echo "[DRAMINIT]: initializing DRAM controller"
+    ;;
+
+PMICWRITE)
+    addr=$(echo "$2" | sed 's/#//')
+    val=$(echo "$3" | sed 's/#//')
+    echo "[PMICWRITE]: wrote $val to PMIC reg $addr"
+    ;;
+
+PMICREAD)
+    reg=$2
+    addr=$(echo "$3" | sed 's/#//')
+    fakepmic=$(( RANDOM % 256 ))
+    eval "$reg=$fakepmic"
+    echo "[PMICREAD]: read $fakepmic from PMIC reg $addr into $reg"
+    ;;
+
+DDRSET)
+    freq=$(echo "$2" | sed 's/#//')
+    echo "[DDRSET]: set DDR freq to ${freq}MHz"
+    ;;
+
+BUSDIV)
+    div=$(echo "$2" | sed 's/#//')
+    echo "[BUSDIV]: set bus clock divider to $div"
+    ;;
+
+NOCONFIG)
+    name=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    echo "[NOCONFIG]: configured NoC interconnect: $name"
+    ;;
+
+BOOTROMCALL)
+    num=$(echo "$2" | sed 's/#//')
+    echo "[BOOTROMCALL]: called internal bootrom fn #$num"
+    ;;
+
+SECURITYLOCK)
+    echo "[SECURITYLOCK]: secure fuse lock engaged"
+    ;;
+
+SECURITYUNLOCK)
+    echo "[SECURITYUNLOCK]: secure fuse lock disabled"
+    ;;
+
+PCIEPOWERON)
+    port=$(echo "$2" | sed 's/#//')
+    echo "[PCIEPOWERON]: powered on PCIe port $port"
+    ;;
+
+PCIEPOWEROFF)
+    port=$(echo "$2" | sed 's/#//')
+    echo "[PCIEPOWEROFF]: powered off PCIe port $port"
+    ;;
+
+QSPIINIT)
+    echo "[QSPIINIT]: initialized QSPI controller"
+    ;;
+
+SPINANDRESET)
+    echo "[SPINANDRESET]: SPI NAND reset done"
+    ;;
+
+EMMCRESET)
+    echo "[EMMCRESET]: eMMC controller reset done"
+    ;;
+
+LOADBOOTLOGO)
+    path=$(echo "$line" | cut -d' ' -f2- | tr -d '"')
+    echo "[LOADBOOTLOGO]: loaded logo from $path"
+    ;;
+
+DISPLAYINIT)
+    echo "[DISPLAYINIT]: initialized display pipeline"
+    ;;
+
+VBATCHECK)
+    reg=$2
+    fakevbat=$(( 3700 + RANDOM % 400 ))
+    eval "$reg=$fakevbat"
+    echo "[VBATCHECK]: read battery voltage into $reg = ${fakevbat}mV"
+    ;;
+JUMPTO)
+    target=$(printf "%s\n" "$line" | cut -d' ' -f2 | xargs)
+    if echo "$target" | grep -q '^#'; then
+        addr=$(echo "$target" | cut -d'#' -f2 | xargs)
+        echo "[JUMPTO]: jumping to address $addr"
+echo "[JUMPTO]: CPU PC ← $addr"
+      else
+        # assume it's register, like R1
+        regname=$(echo "$target" | tr '[:upper:]' '[:lower:]')
+        addr=$(eval echo \$$regname)
+        echo "[JUMPTO]: jumping to register $regname → address $addr"
+    fi
+    ;;
+
+SETPC)
+    addr=$(printf "%s\n" "$line" | cut -d'#' -f2 | xargs)
+    echo "[SETPC]: setting Program Counter (PC) to $addr"
+    PC=$addr
+    ;;
+    GETEL)
+        reg=$(echo "$line" | awk '{print $2}')
+        echo "[GETEL]: current EL → stored in $reg"
+        ;;
+
+    SWITCHEL)
+        level=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        echo "[SWITCHEL]: switched to EL$level"
+        ;;
+
+    SPSRSET)
+        val=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        echo "[SPSRSET]: set SPSR to $val"
+        ;;
+
+    ERET)
+        echo "[ERET]: return from exception"
+        ;;
+
+    CHECKROOTCERT)
+        cert=$(echo "$line" | cut -d'"' -f2)
+        echo "[CHECKROOTCERT]: verified root cert $cert"
+        ;;
+
+    VERIFYCHAIN)
+        chain=$(echo "$line" | cut -d'"' -f2)
+        echo "[VERIFYCHAIN]: verified certificate chain $chain"
+        ;;
+
+    FUSEBLOW)
+        bank=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        bit=$(echo "$line" | awk '{print $3}' | tr -d '#')
+        echo "[FUSEBLOW]: blew bit $bit in fuse bank $bank"
+        ;;
+
+    READFUSE)
+        bank=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        echo "[READFUSE]: read fuse bank $bank → value=0x$(printf "%X" $((RANDOM*RANDOM%999999)))"
+        ;;
+
+    LOCKBOOTROM)
+        echo "[LOCKBOOTROM]: bootrom locked"
+        ;;
+
+    UNLOCKBOOTROM)
+        echo "[UNLOCKBOOTROM]: bootrom unlocked"
+        ;;
+
+    ENABLEJTAG)
+        echo "[ENABLEJTAG]: JTAG debug enabled"
+        ;;
+
+    DISABLEJTAG)
+        echo "[DISABLEJTAG]: JTAG debug disabled"
+        ;;
+
+    I2CWRITE)
+        bus=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        addr=$(echo "$line" | awk '{print $3}' | tr -d '#')
+        val=$(echo "$line" | awk '{print $4}' | tr -d '#')
+        echo "[I2CWRITE]: bus=$bus addr=0x$addr val=0x$val"
+        ;;
+
+    I2CREAD)
+        bus=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        addr=$(echo "$line" | awk '{print $3}' | tr -d '#')
+        reg=$(echo "$line" | awk '{print $4}')
+        echo "[I2CREAD]: bus=$bus addr=0x$addr → stored in $reg"
+        ;;
+
+    SPIWRITE)
+        bus=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        val=$(echo "$line" | awk '{print $3}' | tr -d '#')
+        echo "[SPIWRITE]: bus=$bus val=0x$val"
+        ;;
+
+    SPIREAD)
+        bus=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        reg=$(echo "$line" | awk '{print $3}')
+        echo "[SPIREAD]: bus=$bus → stored in $reg"
+        ;;
+
+    PCIENUMERATE)
+        echo "[PCIENUMERATE]: PCI devices enumerated"
+        ;;
+
+    PCICONFIG)
+        addr=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        val=$(echo "$line" | awk '{print $3}' | tr -d '#')
+        echo "[PCICONFIG]: configured PCI at 0x$addr with 0x$val"
+        ;;
+
+    READTEMP)
+        zone=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        reg=$(echo "$line" | awk '{print $3}')
+        echo "[READTEMP]: $zone temp → stored in $reg"
+        ;;
+
+    THERMALTRIP)
+        zone=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        echo "[THERMALTRIP]: thermal trip set for $zone"
+        ;;
+
+    THERMALUNTRIP)
+        zone=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        echo "[THERMALUNTRIP]: thermal trip cleared for $zone"
+        ;;
+
+    POWEROFF)
+        echo "[POWEROFF]: system powering off"
+        poweroff
+        ;;
+
+    REBOOT)
+        echo "[REBOOT]: reboot triggered"
+        breboot
+        ;;
+
+    SUSPEND)
+        echo "[SUSPEND]: system suspend (fake)"
+        ;;
+
+    UARTDUMP)
+        echo "[UARTDUMP]: dumping memory to UART"
+        ;;
+
+ 
+
+    ASSERT)
+        echo "[ASSERT]: (fake check passed)"
+        ;;
+
+   
+
+    ZEROOUT)
+        addr=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        size=$(echo "$line" | awk '{print $3}' | tr -d '#')
+        echo "[ZEROOUT]: zeroed $size bytes at 0x$addr"
+        ;;
+
+    PATCHMEM)
+        addr=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        val=$(echo "$line" | awk '{print $3}' | tr -d '#')
+        echo "[PATCHMEM]: wrote 0x$val to 0x$addr"
+        ;;
+
+    FILLPATTERN)
+        addr=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        size=$(echo "$line" | awk '{print $3}' | tr -d '#')
+        pat=$(echo "$line" | awk '{print $4}' | tr -d '#')
+        echo "[FILLPATTERN]: filled $size bytes at 0x$addr with 0x$pat"
+        ;;
+
+    FLIPBIT)
+        addr=$(echo "$line" | awk '{print $2}' | tr -d '#')
+        bit=$(echo "$line" | awk '{print $3}' | tr -d '#')
+        echo "[FLIPBIT]: flipped bit $bit at 0x$addr"
+        ;;
+
+            *)
+            # skip labels etc.
+            ;;
+    esac
+done
