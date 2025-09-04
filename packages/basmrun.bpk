@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# BASM interpreter - extended POSIX sh edition 🤑💀
+# BASM interpreter
 # source the library once at startup
 . /data/local/tmp/balkava_hardware/iommu/iommu_lib.sh
 
