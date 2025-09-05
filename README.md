@@ -1,2 +1,2 @@
 # balkava_repo
-package repo for balkava os
+package repo for my Termux based os called balkava os
