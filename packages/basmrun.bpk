@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# BASM interpreter
+# BASM interpreter for my fake os called balkava os
 # source the library once at startup
 . /data/local/tmp/balkava_hardware/iommu/iommu_lib.sh
 
@@ -35,7 +35,7 @@ rand_byte() {
     awk 'BEGIN {srand(); printf("%d\n", int(rand()*256)); }'
 }
 
-# --- UARTPRINT: colored output via printf (portable) ---
+# --- UARTPRINT: colored output via printf for functions ---
 UARTPRINT() {
     text=$1
     color=${2:-32}  # default green
@@ -46,14 +46,14 @@ UARTPRINT() {
     printf "%s UART: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$text" >> "$LOGFILE" 2>/dev/null
 }
 
-# PRINT wrapper used by BASM scripts
+# PRINT wrapper
 PRINT() {
     text=$1
     color=${2:-32}
     UARTPRINT "$text" "$color"
 }
 
-# key=value parser helper (POSIX-safe)
+# key=value parser helper
 kv() {
     key=$1
     args=$2
@@ -74,7 +74,7 @@ klog() {
 }
 
 # -------------------------
-# Hardware simulation ops (POSIX)
+# Hardware simulation ops (fake for my os stimulation)
 # -------------------------
 PCI_SCAN() { klog "PCI_SCAN"; UARTPRINT "PCI: scanning devices..." 36; AL=1; }
 PCI_READ() {
@@ -169,8 +169,7 @@ SENDPACKET(){ klog "SENDPACKET $*"; AL=0; }
 RECEIVEPACKET(){ AL="DATA$(awk 'BEGIN{srand(); print int(rand()*1000)}')"; klog "RECEIVEPACKET -> $AL"; }
 
 KLOG_WRITE(){ msg=$(kv "MSG" "$*"); klog "KLOG_WRITE $msg"; AL=0; }
-# ----More damn KERNEL APIs ----
-# ---- EXTRA ROUND: NUCLEAR PACK (POSIX) ----
+# ----fake KERNEL APIs for my custom kernel for my fake os----
 STATE_ROOT=${STATE_ROOT:-/tmp/balkava_core}
 mkdir -p "$STATE_ROOT/boot/tlb" "$STATE_ROOT/boot/coherent" "$STATE_ROOT/boot/swap" "$STATE_ROOT/proc" "$STATE_ROOT/proc/" "$STATE_ROOT/sys/class/softirq" "$STATE_ROOT/tmp/dm" "$STATE_ROOT/tmp/overlay" "$STATE_ROOT/tmp/checkpoint" "$STATE_ROOT/tmp/oom" "$STATE_ROOT/tmp/cgroupv2" 2>/dev/null || true
 
@@ -708,12 +707,6 @@ random_hardware_event() {
         2) disk_error_check $((RANDOM % 10)) ;;
     esac
 }
-# --- PRINT function for basmrun ---
-PRINT() {
-    local text="$1"
-    local color="${2:-32}"   # default green
-    echo "$text" "$color"
-}
 
 # --- Hardware simulation functions for basmrun ---
 readport() {
@@ -862,7 +855,7 @@ RECEIVEPACKET() {
     echo "Received packet from $ip:$port -> $val" >> /data/local/tmp/balkava_hardware/logs.txt
     AL="$val"
 }
-# --------- end of hardware API functions ---------------
+# --------- end of hardware/kernel API functions for my fake os ---------------
     echo "Status ready on port $port" >> /data/local/tmp/balkava_hardware/logs.txt
 }
 # ---- helpers -----------------------------
@@ -965,7 +958,7 @@ getreg() {
     reg=$1
     eval "echo \$$reg"
 }
-    case "$instr" in      # THIS CASE IS HOLDS ALL FUNCTIONS ON BASM  
+    case "$instr" in 
 SYSCALL|syscall)
 ARG=$@
 echo $ARG >> /data/local/tmp/balkava_a/proc/syscall_queue
@@ -1278,7 +1271,7 @@ DMB\ SY)
                 last_jump=0
             fi
             ;;
-#----------- hardware level things------------------
+#----------- hardware level things of course still for my fake os------------------
     KEYBOARDINT) 
     keyboard_interrupt 
         ;;
@@ -1805,7 +1798,7 @@ CKPT_RESTORE*)
 PREINIT_HOOK*) echo "[HOOK] PRE-INIT triggered";;
 POSTINIT_HOOK*) echo "[HOOK] POST-INIT triggered";;
 REINIT_HOOK*) echo "[HOOK] RE-INIT triggered";;
-#---------- end of hardware API functions ---------------
+#---------- end of hardware things for my fake os ---------------
         RET)
             if [ -s "$stack_file" ]; then
                 pc=$(tail -n1 "$stack_file")
