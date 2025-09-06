@@ -1,7 +1,12 @@
 #!/system/bin/sh
 # BASM interpreter for my fake os called balkava os
 # source the library once at startup
+
+if [ ! -f /data/local/tmp/balkava_a/bin/iommu_lib.sh ]; then
 . /data/local/tmp/balkava_hardware/iommu/iommu_lib.sh
+else
+. /data/local/tmp/balkava_a/bin/iommu_lib.sh
+fi
 
 BASM_FILE="$1"
 TMPDIR="/data/local/tmp/balkava_a/cache/basm_$$"
