@@ -1,0 +1,36 @@
+#!/system/bin/sh
+# safe_move: Balkava OS safe file/directory mover 🛡️
+
+help() {
+    echo "safe_move: balkava os safe file/directory mover"
+    echo "usage: safe_move <file|dir> <outdir>"
+    exit 1
+}
+
+CURRENT="$1"
+OUTDIR="$2"
+
+# Args check
+if [ -z "$CURRENT" ] || [ -z "$OUTDIR" ]; then
+    help
+fi
+
+# Existence checks
+if [ ! -e "$CURRENT" ]; then
+    echo "❌ no file/directory specified"
+    exit 1
+fi
+
+if [ ! -d "$OUTDIR" ]; then
+    echo "❌ output directory does not exist"
+    exit 1
+fi
+
+# Lock, move, unlock
+chmod 555 "$OUTDIR/*"
+if mv "$CURRENT" "$OUTDIR/"; then
+    echo "✅ safely moved $CURRENT → $OUTDIR/"
+else
+    echo "❌ move failed"
+fi
+chmod 700 "$OUTDIR"
