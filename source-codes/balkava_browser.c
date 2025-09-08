@@ -4,7 +4,7 @@
 #include <curl/curl.h>
 
 // you can change the fake website into real malicious websites
-// also don't forget to change PHISHING_SITES_COUNT incase you add many sites
+// also don't forget to change PHISHING_SITES_COUNT incase you add more sites
 
 #define PHISHING_SITES_COUNT 5
 
