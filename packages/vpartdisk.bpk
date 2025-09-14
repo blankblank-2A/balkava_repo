@@ -1,0 +1,953 @@
+#!/bin/sh
+# === BPARTED shell v2 ===
+
+BASE="${BALKAVA_ROOT:-/data/local/tmp/balkava_a}"
+IMG_DIR="$BASE/system"
+META_DIR="$BASE/dev/block"
+CURRENT_DISK_FILE="$META_DIR/current_disk.txt"
+
+mkdir -p "$META_DIR" >/dev/null 2>&1
+
+DEFAULT_SIZE="1M"
+FAKE_SIZE_MM="1T"
+
+# convert human size to KB
+human_to_kb() {
+  h="$1"
+  unit="${h##*[0-9.]}"  # extract unit
+  num="${h%$unit}"      # extract number
+  unit=$(echo "$unit" | tr '[:upper:]' '[:lower:]')
+
+  # Convert to KB
+  case "$unit" in
+    k) val=$(awk -v n="$num" 'BEGIN{printf "%d", n}') ;;
+    m) val=$(awk -v n="$num" 'BEGIN{printf "%d", n*1024}') ;;
+    g) val=$(awk -v n="$num" 'BEGIN{printf "%d", n*1024*1024}') ;;
+    t) val=$(awk -v n="$num" 'BEGIN{printf "%d", n*1024*1024*1024}') ;;
+    *) val=$(awk -v n="$num" 'BEGIN{printf "%d", n}') ;;
+  esac
+
+  # Clamp to max device KB (example: 1TB = 1,073,741,824 KB)
+  max_kb=$((1024*1024*1024))
+  if [ "$val" -gt "$max_kb" ]; then
+    val=$max_kb
+  fi
+
+  echo "$val"
+}
+kb_to_human() {
+  local kb=$1
+  if [ "$kb" -ge $((1024*1024*1024)) ]; then
+    echo "$(awk "BEGIN {printf \"%.3f\", $kb/(1024*1024*1024)}") TB"
+  elif [ "$kb" -ge $((1024*1024)) ]; then
+    echo "$(awk "BEGIN {printf \"%.3f\", $kb/(1024*1024)}") GB"
+  elif [ "$kb" -ge 1024 ]; then
+    echo "$(awk "BEGIN {printf \"%.3f\", $kb/1024}") MB"
+  else
+    echo "${kb} KB"
+  fi
+}
+
+
+# list fake devices
+detect_devices() {
+  echo "mmcblk0"
+  echo "sda"
+  echo "zram0"
+  echo "ufs0"
+  i=0
+  while [ $i -le 3 ]; do
+    echo "dm-$i"
+    echo "loop$i"
+    i=$((i + 1))
+  done
+}
+
+device_fake_size() {
+  dev="$1"
+  case "$dev" in
+    mmcblk*) echo "$FAKE_SIZE_MM" ;;
+    sda) echo "512G" ;;
+    zram*) echo "10G" ;;
+    *) echo "$DEFAULT_SIZE" ;;
+  esac
+}
+
+create_image_if_missing() {
+  dev="$1"
+  img="/data/local/tmp/balkava_a/dev/block/$dev"
+  [ -f "$img" ] && return
+  truncate -s 1K "$img" 2>/dev/null || dd if=/dev/zero of="$img" bs=1 count=0 2>/dev/null
+  echo "device: $dev" > "$META_DIR/$dev"
+  echo "img: $img" >> "$META_DIR/$dev"
+  echo "partitions:" >> "$META_DIR/$dev"
+}
+
+set_gpt() {
+  dev="$1"
+  [ -n "$dev" ] || { echo "Usage: set-gpt <dev>"; return; }
+  create_image_if_missing "$dev"
+  echo "$dev" > "$CURRENT_DISK_FILE"
+  echo "Current disk set to $dev"
+}
+
+get_current_disk() { [ RENT_DISK_FILE ] && cat "$CURRENT_DISK_FILE" || echo ""
+}
+add_partition() {
+  partname="$1"
+  start="$2"
+  end="$3"
+
+  if [ -z "$partname" ] || [ -z "$start" ] || [ -z "$end" ]; then
+    echo "Usage: add-partition <partname> <start> <end>"
+    return
+  fi
+
+  dev=$(get_current_disk)
+  [ -n "$dev" ] || { echo "No current disk set. Use set-gpt <dev> first."; return; }
+  create_image_if_missing "$dev"
+
+  start_kb=$(human_to_kb "$start") || { echo "Invalid start size: $start"; return; }
+  end_kb=$(human_to_kb "$end") || { echo "Invalid end size: $end"; return; }
+
+  dev_fake_kb=$(human_to_kb "$(device_fake_size "$dev")")
+
+  if [ "$start_kb" -ge "$dev_fake_kb" ]; then
+    echo "Error: start ($start_kb KB) is beyond device size ($dev_fake_kb KB)"
+    return
+  fi
+
+  if [ "$end_kb" -gt "$dev_fake_kb" ]; then
+    echo "Warning: partition end exceeds device size! Capping to $dev_fake_kb KB"
+    end_kb=$dev_fake_kb
+  fi
+
+  fake_size=$(( end_kb - start_kb ))
+  [ "$fake_size" -gt 0 ] || { echo "Error: end must be greater than start"; return; }
+
+  [ -f "$META_DIR/$dev" ] || touch "$META_DIR/$dev"
+
+  partitions_section=$(awk '/^partitions:/{flag=1;next}/^directories:/{flag=0}flag' "$META_DIR/$dev")
+  directories_section=$(awk '/^directories:/{flag=1;next}flag' "$META_DIR/$dev")
+
+  overlap=""
+  while read -r line; do
+    [ -z "$line" ] && continue
+    existing_start=$(echo "$line" | awk -F'start:' '{print $2}' | awk '{print $1}')
+    existing_end=$(echo "$line" | awk -F'end:' '{print $2}' | awk '{print $1}')
+    existing_name=$(echo "$line" | awk '{print $1}')
+    if [ "$start_kb" -ge "$existing_start" ] && [ "$start_kb" -lt "$existing_end" ]; then
+      overlap="$existing_name"
+      old_start="$existing_start"
+      old_end="$existing_end"
+      break
+    fi
+  done <<< "$partitions_section"
+
+  if [ -n "$overlap" ]; then
+    printf "ERROR: start KB %s already in partition '%s' (%s -> %s KB)\nAre you sure you want to change start to %s KB? (y/n) " \
+      "$start_kb" "$overlap" "$old_start" "$old_end" "$start_kb"
+    read -r answer
+    case "$answer" in
+      y|Y)
+        echo "Overriding start in partition '$overlap'..."
+        partitions_section=$(echo "$partitions_section" | grep -v "^$overlap ")
+        ;;
+      *)
+        echo "Aborted"; return ;;
+    esac
+  fi
+
+  # remove old partition with same name, merge safely
+  partitions_section=$(echo "$partitions_section" | grep -v "^$partname ")
+  new_partitions="$partitions_section
+$partname start:$start_kb end:$end_kb fake_size:$fake_size"
+
+  {
+    grep -v '^partitions:' "$META_DIR/$dev" | grep -v '^directories:'
+    echo "partitions:"
+    echo "$new_partitions"
+    echo "directories:"
+    echo "$directories_section"
+  } > "$META_DIR/$dev"
+
+  echo "Added partition '$partname' size=$fake_size KB"
+}
+
+# Convert KB offset to human-readable (M/G like fdisk does)
+kb_to_offset() {
+    local kb=$1
+    if [ "$kb" -lt 1024 ]; then
+        echo "${kb}K"
+    elif [ "$kb" -lt 1048576 ]; then
+        echo "$((kb/1024))M"
+    else
+        echo "$((kb/1048576))G"
+    fi
+}
+
+list_partitions() {
+    dev=$(get_current_disk)
+    [ -n "$dev" ] || { echo "No current disk set. Use set-gpt <dev> first."; return; }
+    [ -f "$META_DIR/$dev" ] || { echo "No metadata for $dev"; return; }
+
+    echo "Partitions:"
+    printf "%-20s %-18s %-18s %-12s %-10s %s\n" Name Start End Size FS Flags
+    printf -- "-----------------------------------------------------------------------------------------\n"
+
+    awk '/^partitions:/ {p=1; next} /^directories:/ {p=0} p' "$META_DIR/$dev" | while read line; do
+        [ -z "$line" ] && continue
+        partname=$(echo "$line" | awk '{print $1}')
+        start=$(echo "$line" | awk -F'start:' '{print $2}' | awk '{print $1}')
+        end=$(echo "$line" | awk -F'end:' '{print $2}' | awk '{print $1}')
+        size=$(echo "$line" | awk -F'fake_size:' '{print $2}' | awk '{print $1}')
+        fs=$(echo "$line" | grep -o 'fs:[^ ]*' | cut -d: -f2)
+        flags=$(echo "$line" | grep -o -E 'bootable,esp|bootable|esp|msftdata|metadata|hidden|readonly|raid|lvm|swap|system|root|diag|legacy_boot|atvrecv|bios_grub|hp-service|irst|palo|prep' | tr '\n' ',' | sed 's/,$//')
+
+        # human-readable
+        size_h=$(kb_to_human "$size")
+        start_h=$(kb_to_human "$start")
+        end_h=$(kb_to_human "$end")
+
+        [ -z "$fs" ] && fs="unknown"
+        flags_str=""
+        [ -n "$flags" ] && flags_str="$flags"
+
+        # print aligned table
+        printf "%-20s %-18s %-18s %-12s %-10s %s\n" \
+            "$partname" \
+            "${start} KB ($start_h)" \
+            "${end} KB ($end_h)" \
+            "${size} KB ($size_h)" \
+            "$fs" \
+            "$flags_str"
+    done
+
+    echo
+    echo "Directories:"
+    awk '/^directories:/ {d=1; next} /^$/ {d=0} d' "$META_DIR/$dev" | while read line; do
+        [ -z "$line" ] && continue
+        echo "$line"
+    done
+}
+
+remove_partition() {  
+  partname="$1"  
+  [ -n "$partname" ] || { echo "Usage: remove_partition <partname>"; return; }  
+  
+  dev=$(get_current_disk)  
+  [ -n "$dev" ] || { echo "No current disk set. Use set-gpt <dev> first."; return; }  
+  [ -f "$META_DIR/$dev" ] || { echo "No metadata for $dev"; return; }  
+  
+  partitions_section=$(awk '/^partitions:/{flag=1;next}/^directories:/{flag=0}flag' "$META_DIR/$dev")  
+  directories_section=$(awk '/^directories:/{flag=1;next}flag' "$META_DIR/$dev")  
+  
+  # check if the partition exists  
+  exists=$(echo "$partitions_section" | grep "^$partname ")  
+  [ -n "$exists" ] || { echo "Partition '$partname' not found"; return; }  
+  
+  # remove partition from partitions list  
+  partitions_section=$(echo "$partitions_section" | grep -v "^$partname ")  
+  
+  # remove virtual dirs/files that belong to this partition  
+  directories_section=$(echo "$directories_section" | grep -v "^dir:$partname/" | grep -v "^file:$partname/")  
+  
+  # rebuild the metadata file safely  
+  {  
+    grep -v '^partitions:' "$META_DIR/$dev" | grep -v '^directories:'  
+    echo "partitions:"  
+    echo "$partitions_section"  
+    echo "directories:"  
+    echo "$directories_section"  
+  } > "$META_DIR/$dev"  
+  
+  echo "Partition '$partname' removed (metadata + virtual dirs/files wiped)"  
+}
+
+
+launchshell() {
+  dev=$(get_current_disk)
+  [ -n "$dev" ] || { echo "No disk set"; return; }
+  [ -f "$META_DIR/$dev" ] || touch "$META_DIR/$dev"
+
+  echo "=== Virtual FS shell for $dev ==="
+  while true; do
+    printf "vfs> "
+    read -r cmd args
+    case "$cmd" in
+      exit) break ;;
+      help)
+        echo "Commands: mkdir <dir>, touch <file>, ls [partition/dir], mkfs.<fs> <partition>, exit"
+        ;;
+      mkdir)
+        # same as before: add a directory under directories:
+        if ! grep -q "^directories:" "$META_DIR/$dev"; then
+          echo "" >> "$META_DIR/$dev"
+          echo "directories:" >> "$META_DIR/$dev"
+        fi
+        echo "dir:$args/" >> "$META_DIR/$dev"
+        echo "Directory '$args' created (virtual)"
+        ;;
+      touch)
+        # Make sure directories: exists
+        if ! grep -q "^directories:" "$META_DIR/$dev"; then
+          echo "" >> "$META_DIR/$dev"
+          echo "directories:" >> "$META_DIR/$dev"
+        fi
+        # append file under directories:
+        sed -i "/^directories:/a file:$args" "$META_DIR/$dev"
+        echo "File '$args' created in directories block (virtual)"
+        ;;
+      ls)
+        if [ -n "$args" ]; then
+          echo "$args:"
+          grep -E "^(dir|file):$args" "$META_DIR/$dev" | while read line; do
+            echo "  ${line#*:}"
+          done
+        else
+          # show all partitions (same as before)
+          echo "partitions:"
+          awk '/^partitions:/ {p=1; next} /^directories:/ {p=0} p' "$META_DIR/$dev" | while read line; do
+            [ -z "$line" ] && continue
+            partname=$(echo "$line" | awk '{print $1}')
+            start=$(echo "$line" | awk -F'start:' '{print $2}' | awk '{print $1}')
+            end=$(echo "$line" | awk -F'end:' '{print $2}' | awk '{print $1}')
+            size=$(echo "$line" | awk -F'fake_size:' '{print $2}')
+            echo "$partname -> start: $start KB, end: $end KB, size: $size KB"
+          done
+
+          echo
+          echo "directories:"
+          awk '/^directories:/ {d=1; next} /^$/ {d=0} d' "$META_DIR/$dev" | while read line; do
+            [ -z "$line" ] && continue
+            echo "$line" | sed 's|/|/ |g'
+          done
+        fi
+        ;;
+      mkfs.*)
+        [ -n "$args" ] || { echo "Usage: mkfs.<fs> <partition>"; continue; }
+        # wipe dirs/files only for that partition
+        grep -v "^dir:$args" "$META_DIR/$dev" | grep -v "^file:$args" > "$META_DIR/$dev.tmp"
+        mv "$META_DIR/$dev.tmp" "$META_DIR/$dev"
+        echo "Virtual filesystem '$args' wiped (fake, $cmd)"
+        ;;
+      *) echo "Unknown command: $cmd. Type 'help' for commands." ;;
+    esac
+  done
+}
+
+lspart() {
+  dev=$(get_current_disk)
+  [ -n "$dev" ] || { echo "No disk set"; return; }
+  [ -f "$META_DIR/$dev" ] || { echo "No metadata for $dev"; return; }
+
+  echo "Partitions:"
+  printf "%-20s %-18s %-18s %-18s %-10s %s\n" \
+    "Name" "Start" "End" "Size" "FS" "Flags"
+  echo "-----------------------------------------------------------------------------------------"
+
+  grep -vE '^(MBR|gpt_header|gpt_backup|#|/)' "$META_DIR/$dev" | while read -r line; do
+    [ -z "$line" ] && continue
+
+    name=$(echo "$line" | awk '{print $1}')
+    start=$(echo "$line" | grep -o 'start:[0-9]\+' | cut -d: -f2)
+    end=$(echo "$line" | grep -o 'end:[0-9]\+' | cut -d: -f2)
+    size=$(echo "$line" | grep -o 'fake_size:[0-9]\+' | cut -d: -f2)
+    fs=$(echo "$line" | grep -o 'fs:[^ ]*' | cut -d: -f2)
+
+    # Skip empty or zero-size partitions
+    [ -z "$size" ] && continue
+    [ "$size" -eq 0 ] && continue
+
+    # grab everything after fs:<type>
+    flags=$(echo "$line" | sed -n "s/.*fs:$fs\(.*\)/\1/p" | xargs)
+
+    # convert KB to MB
+    start_mb=$(awk -v n="$start" 'BEGIN {printf "%.3f MB", n/1024}')
+    end_mb=$(awk -v n="$end" 'BEGIN {printf "%.3f MB", n/1024}')
+    size_mb=$(awk -v n="$size" 'BEGIN {printf "%.3f MB", n/1024}')
+
+    start_kb="${start} KB (${start_mb})"
+    end_kb="${end} KB (${end_mb})"
+    size_kb="${size} KB (${size_mb})"
+
+    printf "%-20s %-18s %-18s %-18s %-10s %s\n" \
+      "$name" "$start_kb" "$end_kb" "$size_kb" "${fs:-unknown}" "$flags"
+  done
+}
+mklabel() {
+  dev=$(get_current_disk)
+  [ -n "$dev" ] || { echo "No current disk set. Use set-gpt <dev> first."; return; }
+
+  label_type="$1"
+  [ -n "$label_type" ] || label_type="gpt"
+
+  case "$label_type" in
+    gpt|mbr) ;;
+    *) echo "Unknown label type: $label_type. Use 'gpt' or 'mbr'"; return ;;
+  esac
+
+  # Wipe partitions + directories
+  [ -f "$META_DIR/$dev" ] && > "$META_DIR/$dev"
+  echo "partitions:" > "$META_DIR/$dev"
+  echo "directories:" >> "$META_DIR/$dev"
+  echo "Disk '$dev' label set to $label_type (fake, metadata wiped)"
+}
+
+entermbr() {
+  dev=$(get_current_disk)
+  [ -n "$dev" ] || { echo "No disk set. Use set-gpt <dev> first."; return; }
+
+  SECTOR_SIZE=512
+  TOTAL_SECTORS=$((1024 * 1024 * 2))  # Fake 1 GB disk (~2M sectors)
+  TABLE_TYPE="MBR"
+
+  echo "MBR SHELL"
+  echo "Disk '$dev': $((TOTAL_SECTORS * SECTOR_SIZE / 1024 / 1024)) MB, $SECTOR_SIZE bytes/sector"
+  echo "Sector size (logical/physical): $SECTOR_SIZE bytes"
+  echo "Disklabel type: $TABLE_TYPE"
+  echo ""
+
+  while true; do
+    printf "MBR> "
+    read -r cmd arg1 arg2 arg3
+    case "$cmd" in
+      q|quit) echo "Exiting MBR shell..."; break ;;
+
+      # Print partition table
+   p)
+  echo "Device: $dev"
+  echo "Device       Start(KB)   End(KB)      Size(KB)   Type"
+  awk '/^partitions:/{flag=1;next}/^directories:/{flag=0}flag' "$META_DIR/$dev" | nl -w1 -s' ' | while read -r num line; do
+    start=$(echo "$line" | awk -F'start:' '{print $2}' | awk '{print $1}')
+    end=$(echo "$line" | awk -F'end:' '{print $2}' | awk '{print $1}')
+    size=$((end - start))
+    devp="${dev}p${num}"   # fake device name
+    type="primary"
+    printf "%-12s %-10s %-10s %-10s %s\n" "$devp" "$start" "$end" "$size" "$type"
+  done
+;;
+      # Add new partition
+      n)
+        if [ -z "$arg1" ] || [ -z "$arg2" ]; then
+          echo "Usage: n <startKB> <endKB>"; continue
+        fi
+        start=$arg1
+        end=$arg2
+        size=$((end - start))
+        partname="part$RANDOM"
+        echo "$partname start:$start end:$end" >> "$META_DIR/$dev"
+        echo "Added partition '$partname' $size KB"
+      ;;
+
+      # Delete partition by number
+      d)
+        if [ -z "$arg1" ]; then echo "Usage: d <number>"; continue; fi
+        num=$arg1
+        old_line=$(awk '/^partitions:/{flag=1;next}/^directories:/{flag=0}flag' "$META_DIR/$dev" | sed -n "${num}p")
+        if [ -z "$old_line" ]; then echo "No such partition number"; continue; fi
+        name=$(echo "$old_line" | awk '{print $1}')
+        grep -v "^$name " "$META_DIR/$dev" > "$META_DIR/$dev.tmp"
+        mv "$META_DIR/$dev.tmp" "$META_DIR/$dev"
+        echo "Deleted partition '$name'"
+      ;;
+
+      *) echo "Unknown command. Use: p(print), n(new), d(delete), q(quit)" ;;
+    esac
+  done
+}
+
+# Resize a partition (updates end and size)
+resize_part() {
+     dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+    local pname="$1"
+    local new_size="$2"
+
+    if ! grep -q "^$pname " "$devnew"; then
+        echo "Error: Partition '$pname' not found"
+        return
+    fi
+
+    local start=$(grep "^$pname " "$devnew" | awk '{print $2}' | cut -d: -f2)
+    local end
+    case "$new_size" in
+        *K|*k) end=$((start + ${new_size%?} - 1)) ;;
+        *M|*m) end=$((start + ${new_size%?} * 1024 - 1)) ;;
+        *G|*g) end=$((start + ${new_size%?} * 1024 * 1024 - 1)) ;;
+        *T|*t) end=$((start + ${new_size%?} * 1024 * 1024 * 1024 - 1)) ;;
+        *) end=$((start + new_size - 1)) ;;
+    esac
+
+    sed -i "s/^\($pname start:[^ ]* end:[^ ]* fake_size:[^ ]*\).*/\1 end:$end fake_size:$((end-start))/" "$devnew"
+    echo "Partition '$pname' resized: start=$start KB, end=$end KB, size=$((end-start)) KB"
+}
+
+# Move a partition (updates start/end)
+move_part() {
+     dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+    local pname="$1"
+    local new_start="$2"
+
+    if ! grep -q "^$pname " "$devnew"; then
+        echo "Error: Partition '$pname' not found"
+        return
+    fi
+
+    case "$new_start" in
+        *K|*k) new_start=${new_start%?} ;;
+        *M|*m) new_start=$(( ${new_start%?} * 1024 )) ;;
+        *G|*g) new_start=$(( ${new_start%?} * 1024 * 1024 )) ;;
+        *T|*t) new_start=$(( ${new_start%?} * 1024 * 1024 * 1024 )) ;;
+    esac
+
+    local size=$(grep "^$pname " "$devnew" | awk '{print $4}' | cut -d: -f2)
+    local new_end=$((new_start + size))
+    sed -i "s/^\($pname start:[^ ]* end:[^ ]* fake_size:[^ ]*\).*/$pname start:$new_start end:$new_end fake_size:$size/" "$devnew"
+    echo "Partition '$pname' moved: start=$new_start KB, end=$new_end KB, size=$size KB"
+}
+
+# Toggle a partition flag dynamically
+toggle_flag() {
+     dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+    local pname="$1"
+    local flag="$2"
+
+    if ! grep -q "^$pname " "$devnew"; then
+        echo "Error: Partition '$pname' not found"
+        return
+    fi
+
+    local flags=$(grep "^$pname " "$devnew" | awk '{for(i=5;i<=NF;i++) printf $i" "}')
+
+    if [[ " $flags " == *" $flag "* ]]; then
+        flags="${flags/$flag/}"
+        echo "Flag '$flag' removed from partition '$pname'"
+    else
+        flags="$flags$flag"
+        echo "Flag '$flag' set on partition '$pname'"
+    fi
+
+    sed -i "s/^\($pname start:[^ ]* end:[^ ]* fake_size:[^ ]*\).*/\1 flags:$flags/" "$devnew"
+}
+
+# Swap two partitions dynamically
+swap_part() {
+     dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+    local p1="$1"
+    local p2="$2"
+
+    local line1=$(grep "^$p1 " "$devnew")
+    local line2=$(grep "^$p2 " "$devnew")
+
+    if [ -z "$line1" ] || [ -z "$line2" ]; then
+        echo "Error: Partition not found"
+        return
+    fi
+
+    sed -i "s|^$p1 .*|$line2|" "$devnew"
+    sed -i "s|^$p2 .*|$line1|" "$devnew"
+    echo "Partitions '$p1' and '$p2' swapped!"
+}
+
+# Split a partition dynamically
+split_part() {
+     dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+    local pname="$1"
+    local new_name="$2"
+    local new_size="$3"
+
+    local line=$(grep "^$pname " "$devnew")
+    if [ -z "$line" ]; then echo "Error: Partition '$pname' not found"; return; fi
+
+    local start=$(echo $line | awk '{print $2}' | cut -d: -f2)
+    local end=$(echo $line | awk '{print $3}' | cut -d: -f2)
+    local orig_size=$((end-start))
+
+    if [ "$new_size" -ge "$orig_size" ]; then
+        echo "Error: new size too big to split"
+        return
+    fi
+
+    local new_start=$((start + new_size + 1))
+    local new_end=$end
+    local new_fake_size=$((new_end-new_start))
+
+    sed -i "s|^$pname .*|$pname start:$start end:$((start+new_size)) fake_size:$new_size|" "$devnew"
+    echo "$new_name start:$new_start end:$new_end fake_size:$new_fake_size fs:raw" >> "$devnew"
+    echo "Partition '$pname' split: new '$new_name' created!"
+}
+
+# Merge partitions dynamically
+merge_part() {
+     dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+    local p1="$1"
+    local p2="$2"
+
+    local line1=$(grep "^$p1 " "$devnew")
+    local line2=$(grep "^$p2 " "$devnew")
+    if [ -z "$line1" ] || [ -z "$line2" ]; then
+        echo "Error: Partition not found"
+        return
+    fi
+
+    local start1=$(echo $line1 | awk '{print $2}' | cut -d: -f2)
+    local end2=$(echo $line2 | awk '{print $3}' | cut -d: -f2)
+    local size=$((end2-start1))
+
+    sed -i "s|^$p1 .*|$p1 start:$start1 end:$end2 fake_size:$size|" "$devnew"
+    sed -i "/^$p2 /d" "$devnew"
+    echo "Partitions '$p1' and '$p2' merged!"
+}
+
+# Dynamic setfs function
+setfs() {
+    dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+    local pname="$1"
+    local fstype="$2"
+    local found=0
+
+    grep -q "^$pname " "$devnew" && found=1
+    if [ $found -eq 1 ]; then
+        sed -i "s/^\($pname start:[^ ]* end:[^ ]* fake_size:[^ ]*\).*/\1 fs:$fstype/" "$devnew"
+        echo "Partition '$pname' set to filesystem '$fstype'"
+    else
+        echo "Error: Partition '$pname' not found"
+    fi
+}
+
+# Dynamic change_name function
+change_name() {
+    dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+    local oldname="$1"
+    local newname="$2"
+    local found=0
+
+    grep -q "^$oldname " "$devnew" && found=1
+    if [ $found -eq 1 ]; then
+        sed -i "s/^$oldname /$newname /" "$devnew"
+        echo "Partition '$oldname' renamed to '$newname'"
+    else
+        echo "Error: Partition '$oldname' not found"
+    fi
+}
+
+# human-readable size conversion
+disk_usage() {
+    dev=$(get_current_disk)
+devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+    disk="$1"
+    total_kb=$(human_to_kb "$FAKE_SIZE_MM")
+    used_kb=0
+    last_end=0
+
+    echo "Free spaces in $disk:"
+
+    # read partitions from your disk node
+    while IFS= read -r line; do
+        # skip empty lines and directories
+        [ -z "$line" ] && continue
+        case "$line" in
+            dir:*) continue ;;
+        esac
+
+        # extract start and end KB
+        start=$(echo "$line" | sed -n 's/.*start:\([0-9]*\).*/\1/p')
+        end=$(echo "$line" | sed -n 's/.*end:\([0-9]*\).*/\1/p')
+        [ -z "$start" ] && continue
+        [ -z "$end" ] && continue
+
+        # if there is a gap, print it as free space
+        if [ "$start" -gt "$last_end" ]; then
+            free=$((start - last_end))
+            echo "  Free: $free KB (from $last_end KB to $start KB)"
+        fi
+
+        size=$((end - start))
+        used_kb=$((used_kb + size))
+        last_end=$end
+    done <<EOF
+$(sed -n '/^partitions:/,/^directories:/p' "$devnew" | sed '1d;$d')
+EOF
+
+    # check for free space at the end of disk
+    if [ "$last_end" -lt "$total_kb" ]; then
+        free=$((total_kb - last_end))
+        echo "  Free: $free KB (from $last_end KB to $total_kb KB)"
+    fi
+
+    echo "Total used: $used_kb KB / $total_kb KB ($((used_kb/1024/1024)) GB / $((total_kb/1024/1024)) GB)"
+}
+sector_mode() {
+    dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+
+    if [ ! -e "$devnew" ]; then
+        echo "Error: '$dev' is not a valid disk node! perhaps you used nonexistent disk node or real node."
+        return 1
+    fi
+
+    if [ ! -f "$devnew" ]; then
+        echo "Error: '$dev' not found"
+        return 1
+    fi
+
+    echo "Detected disk: $devnew"
+    echo "=== SECTOR MODE ==="
+    echo "Commands: list, read <sector/part>, write <sector/part> <hex...>, exit"
+    echo "Sectors: mbr, gpt, gpt_backup, <partition_name>"
+    echo "warning ⚠️ modifying gpt header WILL WIPE the partitions and directories of partitions on this partition map"
+
+    while :; do
+        printf "sector_mode> "
+        read CMD ARGS
+
+        case "$CMD" in
+            exit) break ;;
+            list)
+    echo "Partitions and headers:"
+    # print all lines from the parts file
+    cat "$PARTS_FILE"
+    # show MBR/GPT as extra “virtual headers”
+    echo "mbr, gpt, gpt_backup"
+    ;;
+            read)
+                TARGET="$ARGS"
+                case "$TARGET" in
+                    mbr) head -c 512 "$devnew" | xxd ;;
+                    gpt) dd if="$devnew" bs=512 skip=1 count=1 2>/dev/null | xxd ;;
+                    gpt_backup)
+                        SECTORS=$(blockdev --getsz "$devnew" 2>/dev/null || stat -c%s "$devnew")
+                        dd if="$devnew" bs=512 skip=$((SECTORS/512-1)) count=1 2>/dev/null | xxd
+                        ;;
+                    *) grep "^$TARGET" "$PARTS_FILE" ;;
+                esac
+                ;;
+            write)
+                TARGET=$(echo "$ARGS" | awk '{print $1}')
+                HEX=$(echo "$ARGS" | cut -d' ' -f2-)
+                case "$TARGET" in
+                    mbr) echo "$HEX" | xxd -r -p | dd of="$devnew" bs=1 seek=0 count=512 conv=notrunc 2>/dev/null ;;
+                    gpt) echo "$HEX" | xxd -r -p | dd of="$devnew" bs=512 seek=1 count=1 conv=notrunc 2>/dev/null ;;
+                    gpt_backup)
+                        SECTORS=$(blockdev --getsz "$devnew" 2>/dev/null || stat -c%s "$devnew")
+                        echo "$HEX" | xxd -r -p | dd of="$devnew" bs=512 seek=$((SECTORS/512-1)) count=1 conv=notrunc 2>/dev/null ;;
+                    *) echo "Editing partitions directly? Use exit to enter bparted shell." ;;
+                esac
+                ;;
+            *) echo "Unknown command: $CMD" ;;
+        esac
+    done
+}
+find_partition() {
+    PART_NAME="$1"
+    if [ -z "$PART_NAME" ]; then
+        echo "Usage: find_partition <partition_name>"
+        return 1
+    fi
+
+    # get current disk
+    dev=$(get_current_disk)
+    devnew="/data/local/tmp/balkava_a/dev/block/$dev"
+
+    if [ ! -e "$devnew" ]; then
+        echo "Error: '$dev' is not a valid disk node!"
+        return 1
+    fi
+
+    # check if parts file exists
+    if [ ! -f "$devnew" ]; then
+        echo "Error: partitions file not found!"
+        return 1
+    fi
+
+    # search for partition by name
+    PART_INFO=$(grep "^$PART_NAME" "$devnew")
+    if [ -z "$PART_INFO" ]; then
+        echo "Partition '$PART_NAME' not found on disk '$dev'!"
+        return 1
+    fi
+
+    echo "Disk: $dev"
+    echo "$PART_INFO"
+}
+
+mount_partition() {
+  dev=$(get_current_disk)
+  [ -n "$dev" ] || { echo "No disk set"; return; }
+  [ -f "$META_DIR/$dev" ] || { echo "No metadata for $dev"; return; }
+
+  [ -n "$1" ] || { echo "Usage: mount_partition <partition>"; return; }
+  part="$1"
+
+  MNT_DIR="/data/local/tmp/balkava_a/mnt/$part"
+  
+
+  echo "Mounting partition '$part' at $MNT_DIR ..."
+
+  # scan directories block in GPT metadata
+  awk '/^directories:/ {d=1; next} /^$/ {d=0} d' "$META_DIR/$dev" | while read line; do
+    [ -z "$line" ] && continue
+    # skip non-dir/file lines
+    type=${line%%:*}
+    path=${line#*:}
+
+    # check if path belongs to this partition
+    if [[ "$path" == "$part"* ]] || [[ "$part" == "boot" && "$path" == boot/* ]]; then
+      # create directories
+      if [ "$type" = "dir" ]; then
+        mkdir -p "$MNT_DIR/$path"
+      elif [ "$type" = "file" ]; then
+        # create parent dir if missing
+        mkdir -p "$MNT_DIR/$(dirname "$path")"
+        # create empty file
+        touch "$MNT_DIR/$path"
+      fi
+    fi
+  done
+
+  echo "Partition '$part' mounted (fake) with directories and files."
+}
+
+repl() {
+  echo "=== BPARTED shell ==="
+  $label_type
+  echo "Type 'help' for commands. 'exit' to quit."
+
+  while :; do
+    printf "bparted> "
+    read line || break
+    set -- $line
+    cmd="$1"; shift
+
+      case "$cmd" in
+  exit) break ;;
+  help)
+    echo "=== BPARTED Shell Commands ==="
+    echo "Disk / Partition Management:"
+    echo "  list-devices                  : List all detected devices with fake sizes"
+    echo "  create-img <dev>              : Create an image file for device <dev>"
+    echo "  set-gpt <dev>                 : Initialize GPT on <dev>"
+    echo "  mkpart|mkp|add_partition      : Add a new partition"
+    echo "  rm|remove|remove_part          : Remove a partition"
+    echo "  mklabel|mkl|changeto           : Change partition type"
+    echo "  changename|chn                 : Change partition name"
+    echo "  setfs|sfs                      : Set partition filesystem or raw"
+    echo "  merge|mergepart                : Merge two partitions"
+    echo "  splitpart|splitpartition       : Split a partition"
+    echo "  swap|swappart                  : Swap two partitions"
+    echo "  set|toggle                     : Toggle a partition flag"
+    echo "  move|movepart                  : Move partition to new start"
+    echo "  resize|resizepart              : Resize a partition"
+    echo "  list-partitions|p              : Show all partitions"
+    echo "  lspart                         : List partitions (does not print directories)"
+    echo "  listfree|pf                    : Show free disk space"
+    echo "  findpar|fp                     : Find partition by name"
+    echo "  sectormode                     : Enter MBR/GPT sector manager mode"
+    echo "  entermbr                        : Enter MBR shell"
+    echo "  mountdisk|MOUNTMNT|M           : Mount a partition dynamically"
+
+    echo ""
+    echo "=== Virtual FS Launchshell Commands ==="
+    echo "  launchshell                    : Start virtual FS shell"
+    echo "    ls                           : List files and directories (virtual)"
+    echo "    mkdir <dir>                  : Create directory (virtual)"
+    echo "    touch <file>                 : Create empty file (virtual, inside directories block)"
+    echo "    mkfs.<FS> <partition/dir>    : Format virtual directory with filesystem"
+    echo "    exit                         : Exit launchshell"
+    echo ""
+    echo "Type a command and press Enter. Use aliases freely (like mkp for mkpart, p for list-partitions, etc.)"
+    ;;
+      list-devices)
+        detect_devices | while read d; do
+          size=$(device_fake_size "$d")
+          printf "%-12s %s\n" "$d" "$size"
+        done
+        ;;
+      create-img)
+        [ -n "$1" ] && create_image_if_missing "$1" || echo "Usage: create-img <dev>"
+        ;;
+      set-gpt)
+        [ -n "$1" ] && set_gpt "$1" || echo "Usage: set-gpt <dev>"
+        ;;
+      mkpart|mkp|add_partition|partmake)
+        add_partition "$@"
+        ;;
+      list-partitions)
+        list_partitions
+        ;;
+       p|P|print|Print|PRINT)
+        list_partitions
+        ;;
+       launchshell)
+       launchshell
+        ;;
+       rm|remove|remove_part|RM|REMOVE|REMOVE_PART)
+       remove_partition "$@"
+        ;;
+       mklabel|mkl|MKLABEL|MKL|changeto|CHANGETO)
+         mklabel "$@"
+        ;;
+       entermbr|shellmbr|ENTERMBR|SHELLMBR|ENM|ENM)
+        entermbr
+        ;;
+      changename|CHANGENAME|chn|CHN)
+      change_name "$@"
+        ;;
+      setfs|SETFS|SFS|sfs)
+        setfs "$@"
+        ;;
+       merge|MERGE|mergepartition|MERGEPARTITION|MERGEPART|mergepart)
+       merge_part "$@"
+        ;;
+       splitpart|splitpartition|SPLITPART|SPLITPARTITION)
+       split_part "$@"
+        ;;
+       swap|swappart|swappartiton|SWAP|SWAPPART|SWAPPARTITON)
+       swap_part "$@"
+        ;;
+      SET|TOGGLE|set|toggle)
+      toggle_flag "$@"
+        ;;
+       move|MOVE|movepart|MOVEPART)
+       move_part "$@"
+        ;;
+       resize|RESIZE|resizepart|RESIZEPART)
+        resize_part "$@"
+        ;;
+       rename|renamepart|RENAME|RENAMEPART)
+       change_name "$@"
+        ;;
+       listfree|LISTFREE|pf|PF)
+         disk_usage "$@"
+        ;;
+       sectormode|SECTORMODE|sectormanager|SECTORMANAGER)
+        sector_mode
+        ;;
+       findpar|FINDPAR|fp|FP)
+        find_partition "$@"
+        ;;
+       MOUNTDISK|mountdisk|M|m|MOUNTMNT|mountmnt)
+       mount_partition "$@"
+        ;;
+        lspart|LSPART)
+         lspart
+        ;;
+      *)
+        [ -n "$cmd" ] && echo "Unknown command: $cmd"
+        ;;
+    esac
+  done
+
+  echo "Exiting BPARTED shell."
+}
+
+# start REPL
+repl

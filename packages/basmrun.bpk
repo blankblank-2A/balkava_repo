@@ -1,12 +1,5 @@
 #!/system/bin/sh
-# BASM interpreter for my fake os called balkava os
-# source the library once at startup
-
-if [ ! -f /data/local/tmp/balkava_a/bin/iommu_lib.sh ]; then
 . /data/local/tmp/balkava_hardware/iommu/iommu_lib.sh
-else
-. /data/local/tmp/balkava_a/bin/iommu_lib.sh
-fi
 
 BASM_FILE="$1"
 TMPDIR="/data/local/tmp/balkava_a/cache/basm_$$"
@@ -40,7 +33,7 @@ rand_byte() {
     awk 'BEGIN {srand(); printf("%d\n", int(rand()*256)); }'
 }
 
-# --- UARTPRINT: colored output via printf for functions ---
+# --- UARTPRINT: colored output via printf (portable) ---
 UARTPRINT() {
     text=$1
     color=${2:-32}  # default green
@@ -50,15 +43,27 @@ UARTPRINT() {
     printf "\033[%sm%s\033[0m\n" "$color" "$text"
     printf "%s UART: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$text" >> "$LOGFILE" 2>/dev/null
 }
+# create a per-run memory dir
+MEMDIR="/data/local/tmp/balkava_a/cache/basm_mem_$$"
+mkdir -p "$MEMDIR" || exit 1
 
-# PRINT wrapper
+# pointer counter (simple integer). Start at 1000 to avoid tiny numbers accidentally colliding
+PTR_COUNTER=1000
+
+# helper to get file path for a pointer id
+memfile() {
+    # $1 = ptr id
+    printf '%s/%s.bin' "$MEMDIR" "$1"
+}
+
+# PRINT wrapper used by BASM scripts
 PRINT() {
     text=$1
     color=${2:-32}
     UARTPRINT "$text" "$color"
 }
 
-# key=value parser helper
+# key=value parser helper (POSIX-safe)
 kv() {
     key=$1
     args=$2
@@ -78,9 +83,6 @@ klog() {
     printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOGFILE" 2>/dev/null
 }
 
-# -------------------------
-# Hardware simulation ops (fake for my os stimulation)
-# -------------------------
 PCI_SCAN() { klog "PCI_SCAN"; UARTPRINT "PCI: scanning devices..." 36; AL=1; }
 PCI_READ() {
     args=$*
@@ -174,7 +176,6 @@ SENDPACKET(){ klog "SENDPACKET $*"; AL=0; }
 RECEIVEPACKET(){ AL="DATA$(awk 'BEGIN{srand(); print int(rand()*1000)}')"; klog "RECEIVEPACKET -> $AL"; }
 
 KLOG_WRITE(){ msg=$(kv "MSG" "$*"); klog "KLOG_WRITE $msg"; AL=0; }
-# ----fake KERNEL APIs for my custom kernel for my fake os----
 STATE_ROOT=${STATE_ROOT:-/tmp/balkava_core}
 mkdir -p "$STATE_ROOT/boot/tlb" "$STATE_ROOT/boot/coherent" "$STATE_ROOT/boot/swap" "$STATE_ROOT/proc" "$STATE_ROOT/proc/" "$STATE_ROOT/sys/class/softirq" "$STATE_ROOT/tmp/dm" "$STATE_ROOT/tmp/overlay" "$STATE_ROOT/tmp/checkpoint" "$STATE_ROOT/tmp/oom" "$STATE_ROOT/tmp/cgroupv2" 2>/dev/null || true
 
@@ -530,7 +531,6 @@ timer_get() {
   id=$1
   [ -f "$STATE_ROOT/config/timer/$id" ] && cat "$STATE_ROOT/config/timer/$id" || printf "NOTSET\n"
 }
-# ---- EXTRA KERNEL APIs ----
 mkdir -p "$STATE_ROOT/.tmp/mutex" "$STATE_ROOT/irq" "$STATE_ROOT/cache" "$STATE_ROOT/sysinfo" "$STATE_ROOT/traps" "$STATE_ROOT/sched" 2>/dev/null || true
 
 # -- Mutex lock/unlock --
@@ -712,6 +712,12 @@ random_hardware_event() {
         2) disk_error_check $((RANDOM % 10)) ;;
     esac
 }
+# --- PRINT function for fucntions ---
+PRINT() {
+    local text="$1"
+    local color="${2:-32}"   # default green
+    echo "$text" "$color"
+}
 
 # --- Hardware simulation functions for basmrun ---
 readport() {
@@ -741,12 +747,6 @@ READMEM() {
     local addr="$1"
     val=$((RANDOM % 256))
     echo "$val"
-}
-
-WRITEMEM() {
-    local addr="$1"
-    local value="$2"
-    echo "Wrote $value to MEM $addr" >> /data/local/tmp/balkava_hardware/logs.txt
 }
 
 # Fake CPU flags
@@ -860,9 +860,6 @@ RECEIVEPACKET() {
     echo "Received packet from $ip:$port -> $val" >> /data/local/tmp/balkava_hardware/logs.txt
     AL="$val"
 }
-# --------- end of hardware/kernel API functions for my fake os ---------------
-    echo "Status ready on port $port" >> /data/local/tmp/balkava_hardware/logs.txt
-}
 # ---- helpers -----------------------------
 num_to_fg() {
   case "$1" in
@@ -906,6 +903,9 @@ extract_fg() {
 }
 extract_bg() {
   printf '%s\n' "$1" | sed -n 's/^MULTIUARTPRINT[[:space:]]*#\{0,1\}\([0-6]\)[[:space:]]*#\{0,1\}\([0-6]\).*/\2/p'
+}
+do_nothing() {
+# do nothing just a stub function for my functions that do nothing
 }
 # -------------------------------------------------------------------
 
@@ -956,14 +956,108 @@ while [ $running -eq 1 ]; do
         else idx=${1#r}; eval echo "\$reg$idx"; fi
     }
 
-    setreg() { idx=${1#r}; eval "reg$idx=$2"; }
+    # Debug flag
+DEBUG_BASMRUN=1  # set to 0 to disable debug
 
-
-getreg() {
-    reg=$1
-    eval "echo \$$reg"
+# Debug echo helper
+dbg() {
+if [ "$DEBUG_BASMRUN" -eq 1 ]; then
+echo "[DEBUG] $*"
+else
+do_nothing
+fi
 }
-    case "$instr" in 
+
+# Set a register value with debug & pointer/array support
+
+# POSIX-safe debug setreg
+setreg() {
+    orig="$1"
+    val="$2"
+
+    # Debug info
+    dbg "DEBUG: setreg called with orig='$orig' val='$val'"
+
+    # Check for struct access like abc->slot
+    case "$orig" in
+        *"->"*)
+            struct=$(echo "$orig" | cut -d'>' -f1)
+            field=$(echo "$orig" | cut -d'>' -f2 | cut -c2-)  # remove leading -
+            dbg "DEBUG: Detected struct access: struct='$struct' field='$field'"
+            eval "${struct}_${field}=\$val"
+            ;;
+        *"["*"]"*)
+            # Array access r0[5] -> reg0 index 5
+            reg=$(echo "$orig" | cut -d'[' -f1)
+            idx=$(echo "$orig" | cut -d'[' -f2 | cut -d']' -f1)
+            dbg "DEBUG: Detected array access: reg='$reg' idx='$idx'"
+            eval "${reg}_${idx}=\$val"
+            ;;
+        r*)
+            # normal register like r0
+            idx=${orig#r}
+            dbg "DEBUG: Detected register access: r$idx"
+            eval "reg$idx=\$val"
+            ;;
+        *)
+            dbg "DEBUG: Unknown setreg target: $orig"
+            ;;
+    esac
+}
+
+# POSIX-safe debug getreg
+getreg() {
+    orig="$1"
+    val=""
+
+    # Debug info
+    echo "DEBUG: getreg called with orig='$orig'"
+
+    case "$orig" in
+        *"->"*)
+            struct=$(echo "$orig" | cut -d'>' -f1)
+            field=$(echo "$orig" | cut -d'>' -f2 | cut -c2-)  # remove leading -
+            dbg "DEBUG: Detected struct access: struct='$struct' field='$field'"
+            eval "val=\${${struct}_${field}:-0}"
+            ;;
+        *"["*"]"*)
+            reg=$(echo "$orig" | cut -d'[' -f1)
+            idx=$(echo "$orig" | cut -d'[' -f2 | cut -d']' -f1)
+            dbg "DEBUG: Detected array access: reg='$reg' idx='$idx'"
+            eval "val=\${${reg}_${idx}:-0}"
+            ;;
+        r*)
+            idx=${orig#r}
+            dbg "DEBUG: Detected register access: r$idx"
+            eval "val=\${reg$idx:-0}"
+            ;;
+        *)
+            dbg "DEBUG: Unknown getreg target: $orig"
+            val=0
+            ;;
+    esac
+
+    echo "$val"
+}
+gpio_toggle() { PIN="$1"; echo "[HW] GPIO pin $PIN toggled"; }
+gpio_read() { PIN="$1"; echo "[HW] GPIO pin $PIN value simulated: $((RANDOM%2))"; }
+gpio_write() { PIN="$1"; VAL="$2"; echo "[HW] GPIO pin $PIN set to $VAL"; }
+cpu_sleep() { CPU="$1"; echo "[HW] CPU $CPU is now sleeping (simulated)"; }
+cpu_wake() { CPU="$1"; echo "[HW] CPU $CPU woke up (simulated)"; }
+cpu_perf_mode() { CPU="$1"; MODE="$2"; echo "[HW] CPU $CPU set to performance mode: $MODE"; }
+cpu_idle() { CPU="$1"; echo "[HW] CPU $CPU is idle (simulated)"; }
+
+log_msg_ret() {
+    echo "E: $1 -> $2"
+    return $2
+}
+
+log_debug() { # for find_in_blk function(for my bootloaders)
+    echo "D: $*"
+}
+
+
+    case "$instr" in      # THIS CASE IS HOLDS ALL FUNCTIONS ON BASM  
 SYSCALL|syscall)
 ARG=$@
 echo $ARG >> /data/local/tmp/balkava_a/proc/syscall_queue
@@ -1010,36 +1104,345 @@ INIT)
             ;;
     esac
     ;;
-    B.EQ) # Branch if equal
-        label=$(echo "$args" | awk '{print $1}')
-        if [ "$FLAG_Z" = 1 ]; then
-            pc="$label"
-        fi
-        ;;
+  VLD)
+    # vld vd, [addr]  -- loads 16 bytes into vector register
+    IFS=',' read rd mem <<EOF
+$operands
+EOF
+    rd=$(echo "$rd" | tr -d ' ')
+    mem=$(echo "$mem" | tr -d '[] ')
+    rd_idx=$(echo "$rd" | sed 's/v//')
+    addr=$(expr "$mem" + 0)
 
-    B.NE) # Branch if not equal
-        label=$(echo "$args" | awk '{print $1}')
-        if [ "$FLAG_Z" = 0 ]; then
+    # Load 16 bytes into a space-separated string
+    vreg[$rd_idx]="$(echo ${memory[@]:$addr:16})"
+    ;;
+
+VST)
+    IFS=',' read rs mem <<EOF
+$operands
+EOF
+    rs=$(echo "$rs" | tr -d ' ')
+    mem=$(echo "$mem" | tr -d '[] ')
+    rs_idx=$(echo "$rs" | sed 's/v//')
+    addr=$(expr "$mem" + 0)
+
+    hexstr_to_bytes "${vreg[$rs_idx]}" BYTES
+
+    i=0
+    while [ $i -lt 16 ]; do
+        memory[$(expr "$addr" + $i)]="${BYTES[$i]}"
+        i=$(expr $i + 1)
+    done
+    ;;
+
+VSWAP)
+    IFS=',' read ra rb <<EOF
+$operands
+EOF
+    ra=$(echo "$ra" | tr -d ' ')
+    rb=$(echo "$rb" | tr -d ' ')
+    ia=$(echo "$ra" | sed 's/v//')
+    ib=$(echo "$rb" | sed 's/v//')
+
+    tmp="${vreg[$ia]}"
+    vreg[$ia]="${vreg[$ib]}"
+    vreg[$ib]="$tmp"
+    ;;
+
+VMOVN.i16)
+    IFS=',' read rd rs <<EOF
+$operands
+EOF
+    rd=$(echo "$rd" | tr -d ' ')
+    rs=$(echo "$rs" | tr -d ' ')
+    rd_idx=$(echo "$rd" | sed 's/v//')
+    rs_idx=$(echo "$rs" | sed 's/v//')
+
+    hexstr_to_bytes "${vreg[$rs_idx]}" SRC
+
+    OUT=""
+    i=0
+    while [ $i -lt 16 ]; do
+        OUT="$OUT ${SRC[$i]}"
+        i=$(expr $i + 2)
+    done
+
+    # pad to 16 bytes
+    while [ $(echo "$OUT" | wc -w) -lt 16 ]; do
+        OUT="$OUT 00"
+    done
+
+    vreg[$rd_idx]="$OUT"
+    ;;
+
+VSHL.I8)
+    IFS=',' read rd rs imm <<EOF
+$operands
+EOF
+    rd=$(echo "$rd" | tr -d ' ')
+    rs=$(echo "$rs" | tr -d ' ')
+    imm=$(echo "$imm" | tr -d '#')
+    rd_idx=$(echo "$rd" | sed 's/v//')
+    rs_idx=$(echo "$rs" | sed 's/v//')
+
+    hexstr_to_bytes "${vreg[$rs_idx]}" SRC
+
+    OUT=""
+    i=0
+    while [ $i -lt 16 ]; do
+        val=$(expr $(printf "%d" 0x${SRC[$i]}) \* $(expr 2 \*\* "$imm"))
+        val=$(expr "$val" '&' 255)
+        hex=$(printf "%02x" "$val")
+        OUT="$OUT $hex"
+        i=$(expr $i + 1)
+    done
+
+    vreg[$rd_idx]="$OUT"
+    ;;
+
+VSHRN.I16)
+    IFS=',' read rd rs imm <<EOF
+$operands
+EOF
+    rd=$(echo "$rd" | tr -d ' ')
+    rs=$(echo "$rs" | tr -d ' ')
+    imm=$(echo "$imm" | tr -d '#')
+    rd_idx=$(echo "$rd" | sed 's/v//')
+    rs_idx=$(echo "$rs" | sed 's/v//')
+
+    hexstr_to_bytes "${vreg[$rs_idx]}" SRC
+
+    OUT=""
+    i=0
+    while [ $i -lt 16 ]; do
+        hi=$(printf "%d" 0x${SRC[$i+1]})
+        lo=$(printf "%d" 0x${SRC[$i]})
+        val=$(expr \( $hi \* 256 + $lo \) / \( 2 \*\* "$imm" \))
+        val=$(expr "$val" '&' 255)
+        hex=$(printf "%02x" "$val")
+        OUT="$OUT $hex"
+        i=$(expr $i + 2)
+    done
+
+    # pad to 16 bytes
+    while [ $(echo "$OUT" | wc -w) -lt 16 ]; do
+        OUT="$OUT 00"
+    done
+
+    vreg[$rd_idx]="$OUT"
+    ;;
+STRREPLACE)
+    # args: <dst_ptr> <src_ptr> <old> <new>
+    set -- $args
+    dst=$1; src=$2; old=$3; new=$4
+    fsrc=$(memfile "$src")
+    fdst=$(memfile "$dst")
+    if [ ! -f "$fsrc" ]; then
+        printf "[STRREPLACE] src %s not found\n" "$src" >&2
+        r0=-1
+    else
+        # Use sed for literal string replace; escape old/new for sed basic regex:
+        esc() {
+            printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'
+        }
+        old_e=$(esc "$old")
+        new_e=$(esc "$new")
+        sed "s/${old_e}/${new_e}/g" "$fsrc" >"$fdst"
+        r0=0
+        printf "[STRREPLACE] replaced '%s' -> '%s' in %s -> %s\n" "$old" "$new" "$src" "$dst" >&2
+    fi
+    ;;
+STREXPANDVARS)
+    # args: <dst_ptr> <src_ptr> [mappings...]
+    set -- $args
+    dst=$1; src=$2; shift 2
+    fsrc=$(memfile "$src")
+    fdst=$(memfile "$dst")
+    if [ ! -f "$fsrc" ]; then
+        printf "[STREXPANDVARS] src %s not found\n" "$src" >&2
+        r0=-1
+    else
+        # Start with the source content
+        cp "$fsrc" "$MEMDIR/.expand_tmp"
+        # process mappings: PTR:NAME:ptr
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                PTR:*)
+                    # parse PTR:NAME:ptr
+                    mapping="${1#PTR:}"        # NAME:ptr
+                    name=$(printf '%s' "$mapping" | cut -d: -f1)
+                    p=$(printf '%s' "$mapping" | cut -d: -f2-)
+                    pf=$(memfile "$p")
+                    if [ -f "$pf" ]; then
+                        val=$(cat "$pf")
+                        # escape for sed
+                        esc() { printf '%s' "$1" | sed -e 's/[\/&]/\\&/g'; }
+                        sed "s/\\\$$name/$(esc "$val")/g" "$MEMDIR/.expand_tmp" >"$MEMDIR/.expand_tmp2" && mv "$MEMDIR/.expand_tmp2" "$MEMDIR/.expand_tmp"
+                    fi
+                    ;;
+                *)
+                    # ignore unknown mapping form
+                    ;;
+            esac
+            shift
+        done
+        if command -v envsubst >/dev/null 2>&1; then
+            envsubst <"$MEMDIR/.expand_tmp" >"$fdst"
+        else
+            # crude fallback: replace $VAR by value from env using awk
+            awk '{
+                line = $0
+                while (match(line, /\$[A-Za-z_][A-Za-z0-9_]*/)) {
+                    var = substr(line, RSTART+1, RLENGTH-1)
+                    cmd = "printf \"%s\" \"" ENVIRON[var] "\""
+                    # Note: ENVIRON is nonstandard in awk; many awks support ENVIRON, but if not, shell fallback needed.
+                    repl = ENVIRON[var]
+                    line = substr(line, 1, RSTART-1) repl substr(line, RSTART+RLENGTH)
+                }
+                print line
+            }' "$MEMDIR/.expand_tmp" >"$fdst"
+        fi
+
+        rm -f "$MEMDIR/.expand_tmp" "$MEMDIR/.expand_tmp2" 2>/dev/null || :
+        r0=0
+        printf "[STREXPANDVARS] expanded %s -> %s\n" "$src" "$dst" >&2
+    fi
+    ;;
+STRSPLIT)
+    # args: <src_ptr> <delim> <out_base_ptr>
+    set -- $args
+    src=$1; delim=$2; base=$3
+    fsrc=$(memfile "$src")
+    if [ ! -f "$fsrc" ]; then
+        printf "[STRSPLIT] src %s not found\n" "$src" >&2
+        r0=-1
+    else
+        # convert delim to literal for tr (if single char)
+        # for multi-char delim, use awk
+        if [ "${#delim}" -eq 1 ]; then
+            # simple split on single-char delim
+            tokens=$(tr "$delim" '\n' <"$fsrc")
+            i=0
+            while IFS= read -r line; do
+                ptr=$((base + i))
+                printf '%s' "$line" >"$(memfile "$ptr")"
+                i=$((i+1))
+            done <<EOF
+$tokens
+EOF
+            r0=$i
+            printf "[STRSPLIT] created %s tokens from %s starting at %s\n" "$r0" "$src" "$base" >&2
+        else
+            # multi-char delim -> awk split
+            i=0
+            awk -v RS="" -v ORS="\n" -v FS="$delim" '{
+                for (i=1;i<=NF;i++) print $i
+            }' "$fsrc" | while IFS= read -r line; do
+                ptr=$((base + i))
+                printf '%s' "$line" >"$(memfile "$ptr")"
+                i=$((i+1))
+            done
+            r0=$i
+        fi
+    fi
+    ;;
+REGEXSEARCH)
+    # args: <src_ptr> <regex> [all]
+    set -- $args
+    src=$1; regex=$2; mode=$3
+    fsrc=$(memfile "$src")
+    if [ ! -f "$fsrc" ]; then
+        printf "[REGEXSEARCH] src %s not found\n" "$src" >&2
+        r0=-1
+    else
+        if [ "$mode" = "all" ]; then
+            # print all match byte offsets, one per line, return count in r0
+            # we use awk to scan bytes; convert file to a single line preserving bytes
+            # Use grep -b -o if available (most systems)
+            if grep -b -o -E "$regex" "$fsrc" >/dev/null 2>&1; then
+                grep -b -o -E "$regex" "$fsrc" | cut -d: -f1
+                r0=$(grep -b -o -E "$regex" "$fsrc" | wc -l)
+            else
+                r0=0
+            fi
+        else
+            # return first match offset (byte index) or -1
+            if grep -b -o -E "$regex" "$fsrc" >/dev/null 2>&1; then
+                pos=$(grep -b -o -E "$regex" "$fsrc" | head -n1 | cut -d: -f1)
+                r0=$pos
+            else
+                r0=-1
+            fi
+        fi
+        printf "[REGEXSEARCH] src %s regex '%s' => r0=%s\n" "$src" "$regex" "$r0" >&2
+    fi
+    ;;
+
+EXPORT|ADDENV)
+    # Check if NAME is provided
+    if [ -z "$1" ]; then
+        echo "Error: No variable name provided!" >&2
+        break  # or return 1 if inside a function
+    fi
+
+    NAME=$1
+    # Grab all remaining args as the value (handles spaces)
+    shift
+    ARGS="$*"
+
+    # Export safely
+    export "$NAME=$ARGS"
+    echo "Exported: $NAME='$ARGS'"
+    ;;
+    BEQ|BNE|BGT|BLT|BGE|BLE) 
+    # Extract label and optional offset
+    label=$(echo "$args" | awk '{print $1}')
+    offset=$(echo "$args" | awk '{print $2}')
+
+    # Default: branch not taken
+    branch_taken=0
+
+    # Determine condition code
+    case "$opcode" in
+        BEQ) [ "$FLAG_Z" = 1 ] && branch_taken=1 ;;
+        BNE) [ "$FLAG_Z" = 0 ] && branch_taken=1 ;;
+        BGT) [ "$FLAG_Z" = 0 ] && [ "$FLAG_N" = "$FLAG_V" ] && branch_taken=1 ;;
+        BLT) [ "$FLAG_N" != "$FLAG_V" ] && branch_taken=1 ;;
+        BGE) [ "$FLAG_N" = "$FLAG_V" ] && branch_taken=1 ;;
+        BLE) [ "$FLAG_Z" = 1 ] || [ "$FLAG_N" != "$FLAG_V" ] && branch_taken=1 ;;
+    esac
+
+    # Perform branch if condition met
+    if [ "$branch_taken" = 1 ]; then
+        if [ -n "$offset" ]; then
+            # Handle signed offsets like real ASM
+            pc=$((pc + offset))
+        else
             pc="$label"
         fi
-        ;;
-    MOVEK) # MOVEK rX IMM SHIFT
-        r=$(echo "$args" | awk '{print $1}')
-        imm=$(echo "$args" | awk '{print $2}')
-        shift=$(echo "$args" | awk '{print $3}')
-        old=$(getreg "$r")
-        mask=$((~(0xFFFF << shift)))
-        val=$(( (old & mask) | (imm << shift) ))
-        setreg "$r" "$val"
-        ;;
+    fi
+
+    # Optional: simulate pre/post-indexing updates for pseudo-registers
+    if echo "$args" | grep -q "!" ; then
+        REG_BASE=$((REG_BASE + 4))
+    fi
+
+    # Optional: handle multiple registers in brackets
+    if echo "$args" | grep -q "\[" ; then
+        REG1=$((REG1 + 1))
+        REG2=$((REG2 + 1))
+    fi
+    ;;
     ADRP) # ADRP rDST ADDR
         r=$(echo "$args" | awk '{print $1}')
         addr=$(echo "$args" | awk '{print $2}')
         page=$(( addr & 0xFFFFFFFFFFFFF000 ))
         setreg "$r" "$page"
         ;;
-       return)
-       exit 0
+        RETURN)
+       CODE=$1
+       exit $CODE
         ;;
         OEM_UNLCK)
         val=$(echo "$line" | awk '{print $2}')
@@ -1050,11 +1453,131 @@ INIT)
         val=$(echo "$line" | awk '{print $2}')
         echo "[DM_VERITY]: dm-verity state set to $val"
         ;;
-        MOVE)
+MOVE)
             dest=$(echo "$2" | tr -d ','); src="$3"
             val=$(getval "$src")
             setreg "$dest" "$val"
             ;;
+MOVES)
+    reg="$2"
+    val="$3"
+
+    old=$(getreg "$reg")
+    if [ -z "$old" ]; then old=0; fi
+
+    # signed 32-bit handling
+    if [ "$val" -ge 2147483648 ]; then
+        val=$(expr "$val" - 4294967296)
+    fi
+
+    new=$(expr "$old" + "$val")
+    setreg "$reg" "$new"
+    ;;
+
+MOVEU)
+    reg="$2"
+    val="$3"
+
+    old=$(getreg "$reg")
+    if [ -z "$old" ]; then old=0; fi
+
+    # force unsigned 32-bit mask
+    old_masked=$(expr "$old" '&' 4294967295)
+    val_masked=$(expr "$val" '&' 4294967295)
+    new=$(expr "$old_masked" '|' "$val_masked")
+    setreg "$reg" "$new"
+    ;;
+
+MOVEB)
+    reg="$2"
+    val="$3"
+
+    old=$(getreg "$reg")
+    if [ -z "$old" ]; then old=0; fi
+
+    mask=$(expr 4294967295 - 255)
+    new=$(expr "$old" '&' "$mask" '|' "$val" '&' 255)
+    setreg "$reg" "$new"
+    ;;
+
+MOVEH)
+    reg="$2"
+    val="$3"
+
+    old=$(getreg "$reg")
+    if [ -z "$old" ]; then old=0; fi
+
+    mask=$(expr 4294967295 - 65535)
+    new=$(expr "$old" '&' "$mask" '|' "$val" '&' 65535)
+    setreg "$reg" "$new"
+    ;;
+
+MOVEL)
+    reg="$2"
+    val="$3"
+
+    new=$(expr "$val" '&' 4294967295)
+    setreg "$reg" "$new"
+    ;;
+
+MOVEH32)
+    reg="$2"
+    val="$3"
+
+    # POSIX-safe 32-bit shift
+    high=$(expr "$val" / 4294967296)
+    new=$(expr "$high" '&' 4294967295)
+    setreg "$reg" "$new"
+    ;;
+
+MOVEPTR)
+    reg="$2"
+    ptr="$3"
+
+    setreg "$reg" "$ptr"
+    ;;
+
+MOVEADDR)
+    reg="$2"
+    addr="$3"
+
+    if [ "$addr" -ge 0 ] && [ "$addr" -le 4294967295 ]; then
+        setreg "$reg" "$addr"
+    fi
+    ;;
+
+MOVX)
+    reg="$2"
+    val="$3"
+
+    setreg "$reg" "$val"
+    ;;
+MOVEK)
+    reg="$2"       # r1
+    imm="$3"       # 0x2
+    shift="$4"     # 64
+
+    old=$(getreg "$reg")
+    if [ -z "$old" ]; then old=0; fi
+
+    # compute mask = ~((1 << shift) - 1)
+    # 1 << shift = 2^shift
+    one_shift=$(expr 1 \* 1)
+    pow=1
+    i=0
+    while [ "$i" -lt "$shift" ]; do
+        pow=$(expr "$pow" \* 2)
+        i=$(expr "$i" + 1)
+    done
+    mask=$(expr 4294967295 - "$pow" + 1)
+
+    # imm << shift = imm * 2^shift
+    imm_shifted=$(expr "$imm" \* "$pow")
+
+    # combine with old value
+    new=$(expr "$old" '&' "$mask" '|' "$imm_shifted")
+    setreg "$reg" "$new"
+    ;;
         ADD|SUB|MUL|DIV|AND|OR|XOR)
             dest=$(echo "$2" | tr -d ','); a=$(echo "$3" | tr -d ','); b="$4"
             va=$(getval "$a"); vb=$(getval "$b")
@@ -1116,6 +1639,21 @@ INIT)
         echo " "
         fi
         ;;
+        PRINTL|LOOP-PRINT)
+        while true; do
+        text=$(echo "$line" | sed 's/^[^"]*"//;s/"$//')
+        echo "$text"
+        sleep 0.1
+        done
+        ;;
+       WATCH-PRINT|PRINTW)
+       while true; do
+    text=$(echo "$line" | sed 's/^[^"]*"//;s/"$//')  # Clean quotes
+    clear                                           # Clear terminal
+    echo "$text"                                    # Print text
+    sleep 0.7
+done
+;;
     STLXR)
         reg=$(echo "$line" | awk '{print $2}')
         addr=$(echo "$line" | awk '{print $3}')
@@ -1275,8 +1813,968 @@ DMB\ SY)
             else
                 last_jump=0
             fi
+           ;;
+BIC)  # Bitwise AND NOT
+    args_arr=($args)
+    reg=${args_arr[0]}
+    val=${args_arr[1]}
+    eval "$reg=\$(( $reg & (~$val) ))"
+    ;;
+
+EOR)  # Bitwise XOR
+    args_arr=($args)
+    reg=${args_arr[0]}
+    val=${args_arr[1]}
+    eval "$reg=\$(( $reg ^ $val ))"
+    ;;
+LSL)  # Logical Shift Left
+    args_arr=($args)
+    reg=${args_arr[0]}
+    val=${args_arr[1]}
+    eval "$reg=\$(( $reg << $val ))"
+    ;;
+
+LSR)  # Logical Shift Right
+    args_arr=($args)
+    reg=${args_arr[0]}
+    val=${args_arr[1]}
+    eval "$reg=\$(( $reg >> $val ))"
+    ;;
+
+ASR)  # Arithmetic Shift Right
+    args_arr=($args)
+    reg=${args_arr[0]}
+    val=${args_arr[1]}
+    # preserve sign for negative numbers
+    eval "$reg=\$(( ( $reg >> $val ) | ( ( $reg & 0x80000000 ) * ( (1 << $val) - 1 ) ) ))"
+    ;;
+
+ROR)  # Rotate Right
+    args_arr=($args)
+    reg=${args_arr[0]}
+    val=${args_arr[1]}
+    eval "$reg=\$(( ( $reg >> $val ) | ( $reg << (32 - $val) & 0xFFFFFFFF ) ))"
+    ;;
+
+MALLOC)
+    # args: <size>
+    set -- $args
+    size=$1
+    ptr=$(expr $PTR_COUNTER + 1)
+    PTR_COUNTER=$ptr
+    f=$(memfile "$ptr")
+    dd if=/dev/zero of="$f" bs=1 count="$size" 2>/dev/null || :
+    r0=$ptr
+    printf "[MALLOC] %s bytes -> ptr %s\n" "$size" "$ptr" >&2
+    ;;
+
+FREE)
+    set -- $args
+    ptr=$1
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        rm -f "$f"
+        printf "[FREE] freed ptr %s\n" "$ptr" >&2
+    else
+        printf "[FREE] ptr %s not found\n" "$ptr" >&2
+    fi
+    ;;
+
+WRITEMEM)
+    set -- $args
+    ptr=$1
+    shift
+    val="$*"
+    f=$(memfile "$ptr")
+    : > "$f"
+    printf '%s' "$val" > "$f"
+    printf "[WRITEMEM] wrote %s bytes to %s\n" "$(printf '%s' "$val" | wc -c | tr -d ' ')" "$ptr" >&2
+    ;;
+
+READMEM)
+    set -- $args
+    ptr=$1
+    len=$2
+    f=$(memfile "$ptr")
+    if [ ! -f "$f" ]; then
+        r0=""
+        printf "[MEMREAD] ptr %s not found\n" "$ptr" >&2
+    else
+        r0=$(dd if="$f" bs=1 count="$len" 2>/dev/null)
+        printf "[MEMREAD] read %s bytes from %s\n" "$(printf '%s' "$r0" | wc -c | tr -d ' ')" "$ptr" >&2
+    fi
+    ;;
+
+MEMCPY)
+    set -- $args
+    dst=$1
+    src=$2
+    nbytes=$3
+    fdst=$(memfile "$dst")
+
+    if [ -f "$(memfile "$src")" ]; then
+        fsrc=$(memfile "$src")
+        dd if="$fsrc" of="$fdst" bs=1 count="$nbytes" conv=notrunc 2>/dev/null
+    else
+        printf "%.*s" "$nbytes" "$src" | dd of="$fdst" bs=1 conv=notrunc 2>/dev/null
+    fi
+    r0=0
+    printf "[MEMCPY] copied %s bytes from %s -> %s\n" "$nbytes" "$src" "$dst" >&2
+    ;;
+
+MEMSET)
+    set -- $args
+    ptr=$1
+    byte=$2
+    len=$3
+    f=$(memfile "$ptr")
+
+    case "$byte" in
+        ''|*[!0-9]*)
+            ch=$(printf '%s' "$byte" | cut -c1)
             ;;
-#----------- hardware level things of course still for my fake os------------------
+        *)
+            ch=$(printf "\\$(printf '%03o' "$byte")")
+            ;;
+    esac
+
+    dd if=/dev/zero bs=1 count="$len" 2>/dev/null | tr '\0' "$ch" > "$f"
+    printf "[MEMSET] set %s bytes at %s to byte '%s'\n" "$len" "$ptr" "$byte" >&2
+    ;;
+
+STRLEN)
+    set -- $args
+    ptr=$1
+    f=$(memfile "$ptr")
+    if [ ! -f "$f" ]; then
+        r0=0
+    else
+        r0=$(wc -c < "$f" | tr -d ' ')
+    fi
+    printf "[STRLEN] ptr %s length %s\n" "$ptr" "$r0" >&2
+    ;;
+
+STRCMP)
+    set -- $args
+    p1=$1
+    p2=$2
+    f1=$(memfile "$p1")
+    f2=$(memfile "$p2")
+    if [ ! -f "$f1" ] || [ ! -f "$f2" ]; then
+        r0=1
+    else
+        cmp -s "$f1" "$f2"
+        r0=$?
+    fi
+    printf "[STRCMP] result %s\n" "$r0" >&2
+    ;;
+MEMSLICE)
+    # args: <src_ptr> <offset> <len>
+    set -- $args
+    src=$1
+    off=$2
+    len=$3
+    fsrc=$(memfile "$src")
+    if [ ! -f "$fsrc" ]; then
+        printf "[MEMSLICE] src %s not found\n" "$src" >&2
+        r0=0
+    else
+        ptr=`expr $PTR_COUNTER + 1`
+        PTR_COUNTER=$ptr
+        fdst=$(memfile "$ptr")
+        dd if="$fsrc" of="$fdst" bs=1 skip="$off" count="$len" 2>/dev/null || :
+        r0=$ptr
+        printf "[MEMSLICE] created ptr %s slice of %s@%s len %s\n" "$ptr" "$src" "$off" "$len" >&2
+    fi
+    ;;
+
+HEXDUMP)
+    set -- $args
+    ptr=$1
+    len=$2
+    f=$(memfile "$ptr")
+    if [ ! -f "$f" ]; then
+        printf "[HEXDUMP] ptr %s not found\n" "$ptr" >&2
+    else
+        dd if="$f" bs=1 count="$len" 2>/dev/null | od -An -tx1 | tr -s ' ' | sed 's/^ //;s/ $//'
+    fi
+    ;;
+
+MEMWRITEHEX)
+    set -- $args
+    ptr=$1
+    shift
+    hex="$*"
+    f=$(memfile "$ptr")
+    : > "$f"
+    i=1
+    while [ $i -le ${#hex} ]; do
+        h=`echo "$hex" | cut -c $i-$((i+1))`
+        # POSIX printf hex to byte
+        printf "\\\x$h" >> "$f"
+        i=`expr $i + 2`
+    done
+    printf "[MEMWRITEHEX] wrote `wc -c <"$f" | tr -d ' '` bytes to %s\n" "$ptr" >&2
+    ;;
+
+MEMWRITEBIN)
+    set -- $args
+    ptr=$1
+    srcfile=$2
+    f=$(memfile "$ptr")
+    if [ ! -f "$srcfile" ]; then
+        printf "[MEMWRITEBIN] source %s not found\n" "$srcfile" >&2
+    else
+        cp "$srcfile" "$f"
+        printf "[MEMWRITEBIN] wrote %s -> %s (%s bytes)\n" "$srcfile" "$ptr" "`wc -c <"$f" | tr -d ' '`" >&2
+    fi
+    ;;
+
+MEMDUMP)
+    set -- $args
+    ptr=$1
+    len=$2
+    outfile=$3
+    f=$(memfile "$ptr")
+    if [ ! -f "$f" ]; then
+        printf "[MEMDUMP] ptr %s not found\n" "$ptr" >&2
+    else
+        dd if="$f" of="$outfile" bs=1 count="$len" 2>/dev/null || :
+        printf "[MEMDUMP] dumped %s bytes from %s -> %s\n" "$len" "$ptr" "$outfile" >&2
+    fi
+    ;;
+
+HEXLEN)
+    set -- $args
+    ptr=$1
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        r0=`wc -c <"$f" | tr -d ' '`
+    else
+        r0=0
+    fi
+    printf "[HEXLEN] ptr %s length %s\n" "$ptr" "$r0" >&2
+    ;;
+
+MEMROTATE)
+    set -- $args
+    ptr=$1
+    len=$2
+    dir=$3
+    count=$4
+    f=$(memfile "$ptr")
+    if [ ! -f "$f" ]; then
+        r0=0
+    else
+        dd if="$f" bs=1 count="$len" 2>/dev/null >"$MEMDIR/rotbuf"
+        case "$dir" in
+            L)
+                dd if="$MEMDIR/rotbuf" bs=1 skip="$count" 2>/dev/null >"$MEMDIR/rotout"
+                dd if="$MEMDIR/rotbuf" bs=1 count="$count" 2>/dev/null >>"$MEMDIR/rotout"
+                ;;
+            R)
+                off=`expr $len - $count`
+                dd if="$MEMDIR/rotbuf" bs=1 skip="$off" 2>/dev/null >"$MEMDIR/rotout"
+                dd if="$MEMDIR/rotbuf" bs=1 count="$off" 2>/dev/null >>"$MEMDIR/rotout"
+                ;;
+        esac
+        mv "$MEMDIR/rotout" "$f"
+        rm -f "$MEMDIR/rotbuf"
+        r0=$len
+        printf "[MEMROTATE] rotated %s bytes %s by %s\n" "$len" "$dir" "$count" >&2
+    fi
+    ;;
+
+MEMCMPN)
+    set -- $args
+    p1=$1
+    p2=$2
+    len=$3
+    f1=$(memfile "$p1")
+    f2=$(memfile "$p2")
+    if [ -f "$f1" ] && [ -f "$f2" ]; then
+        dd if="$f1" bs=1 count="$len" 2>/dev/null >"$MEMDIR/c1"
+        dd if="$f2" bs=1 count="$len" 2>/dev/null >"$MEMDIR/c2"
+        cmp -s "$MEMDIR/c1" "$MEMDIR/c2"
+        if [ $? -eq 0 ]; then
+            r0=0
+        else
+            r0=1
+        fi
+        rm -f "$MEMDIR/c1" "$MEMDIR/c2"
+    else
+        r0=-1
+    fi
+    ;;
+
+MEMMOVE)
+    set -- $args
+    dst=$1
+    src=$2
+    len=$3
+    fdst=$(memfile "$dst")
+    fsrc=$(memfile "$src")
+    if [ ! -f "$fsrc" ]; then
+        printf "[MEMMOVE] src %s not found\n" "$src" >&2
+        r0=0
+    else
+        tmp=`mktemp`
+        dd if="$fsrc" bs=1 count="$len" 2>/dev/null >"$tmp"
+        dd if="$tmp" of="$fdst" bs=1 count="$len" conv=notrunc 2>/dev/null
+        rm -f "$tmp"
+        r0=$len
+        printf "[MEMMOVE] moved %s bytes from %s -> %s (safe)\n" "$len" "$src" "$dst" >&2
+    fi
+    ;;
+
+MEMZERO)
+    set -- $args
+    ptr=$1
+    len=$2
+    f=$(memfile "$ptr")
+    : > "$f"
+    dd if=/dev/zero of="$f" bs=1 count="$len" 2>/dev/null
+    r0=$len
+    printf "[MEMZERO] zeroed %s bytes at %s\n" "$len" "$ptr" >&2
+    ;;
+
+MEMSCAN)
+    set -- $args
+    ptr=$1
+    byte=$2
+    len=$3
+    f=$(memfile "$ptr")
+    if [ ! -f "$f" ]; then
+        printf "[MEMSCAN] ptr %s not found\n" "$ptr" >&2
+        r0=-1
+    else
+        dd if="$f" bs=1 count="$len" 2>/dev/null | od -An -tx1 | tr -s ' ' | \
+        awk -v target="$byte" '{
+            for(i=1;i<=NF;i++){if($i==target){print NR+i-2; exit}}
+        }' >"$MEMDIR/scanres"
+        if [ -s "$MEMDIR/scanres" ]; then
+            r0=`cat "$MEMDIR/scanres"`
+        else
+            r0=-1
+        fi
+        rm -f "$MEMDIR/scanres"
+    fi
+    ;;
+
+MEMRCHR)
+    set -- $args
+    ptr=$1
+    byte=$2
+    len=$3
+    f=$(memfile "$ptr")
+    if [ ! -f "$f" ]; then
+        r0=-1
+    else
+        dd if="$f" bs=1 count="$len" 2>/dev/null | od -An -tx1 | tr -s ' ' | \
+        awk -v target="$byte" '{
+            for(i=NF;i>=1;i--){if($i==target){print NR+i-2; exit}}
+        }' >"$MEMDIR/scanres"
+        if [ -s "$MEMDIR/scanres" ]; then
+            r0=`cat "$MEMDIR/scanres"`
+        else
+            r0=-1
+        fi
+        rm -f "$MEMDIR/scanres"
+    fi
+    ;;
+
+MEMSWAP)
+    set -- $args
+    p1=$1
+    p2=$2
+    len=$3
+    f1=$(memfile "$p1")
+    f2=$(memfile "$p2")
+    tmp=`mktemp`
+    if [ -f "$f1" ] && [ -f "$f2" ]; then
+        dd if="$f1" bs=1 count="$len" 2>/dev/null >"$tmp"
+        dd if="$f2" bs=1 count="$len" 2>/dev/null of="$f1" conv=notrunc
+        dd if="$tmp" bs=1 count="$len" 2>/dev/null of="$f2" conv=notrunc
+        r0=$len
+        printf "[MEMSWAP] swapped %s bytes between %s and %s\n" "$len" "$p1" "$p2" >&2
+    else
+        r0=0
+    fi
+    rm -f "$tmp"
+    ;;
+STRCPY)
+    set -- $args
+    dst=$1
+    src=$2
+    fsrc=$(memfile "$src")
+    fdst=$(memfile "$dst")
+    if [ -f "$fsrc" ]; then
+        cp "$fsrc" "$fdst"
+        r0=0
+        printf "[STRCPY] copied string from %s -> %s\n" "$src" "$dst" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRNCPY)
+    set -- $args
+    dst=$1
+    src=$2
+    n=$3
+    fsrc=$(memfile "$src")
+    fdst=$(memfile "$dst")
+    if [ -f "$fsrc" ]; then
+        dd if="$fsrc" of="$fdst" bs=1 count="$n" 2>/dev/null || :
+        r0=0
+        printf "[STRNCPY] copied %s chars from %s -> %s\n" "$n" "$src" "$dst" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRCAT)
+    set -- $args
+    dst=$1
+    src=$2
+    fsrc=$(memfile "$src")
+    fdst=$(memfile "$dst")
+    if [ -f "$fsrc" ] && [ -f "$fdst" ]; then
+        cat "$fsrc" >>"$fdst"
+        r0=0
+        printf "[STRCAT] appended %s -> %s\n" "$src" "$dst" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRLEN)
+    ptr=$args
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        r0=`wc -c <"$f" | tr -d ' '`
+        printf "[STRLEN] length of %s = %s\n" "$ptr" "$r0" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRCMP)
+    set -- $args
+    p1=$1
+    p2=$2
+    f1=$(memfile "$p1")
+    f2=$(memfile "$p2")
+    if [ -f "$f1" ] && [ -f "$f2" ]; then
+        cmp -s "$f1" "$f2"
+        if [ $? -eq 0 ]; then
+            r0=0
+        else
+            r0=1
+        fi
+        printf "[STRCMP] compared %s and %s => %s\n" "$p1" "$p2" "$r0" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRSTR)
+    set -- $args
+    hay=$1
+    nee=$2
+    fh=$(memfile "$hay")
+    fn=$(memfile "$nee")
+    if [ -f "$fh" ] && [ -f "$fn" ]; then
+        needle=`cat "$fn"`
+        pos=`grep -b -o "$needle" "$fh" | head -n1 | cut -d: -f1`
+        if [ -n "$pos" ]; then
+            r0=$pos
+        else
+            r0=-1
+        fi
+        printf "[STRSTR] searched for %s in %s => %s\n" "$nee" "$hay" "$r0" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRREV)
+    ptr=$args
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        rev "$f" >"$MEMDIR/revtmp"
+        mv "$MEMDIR/revtmp" "$f"
+        r0=0
+        printf "[STRREV] reversed string at %s\n" "$ptr" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRUPPER)
+    ptr=$args
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        tr '[:lower:]' '[:upper:]' <"$f" >"$MEMDIR/uptmp"
+        mv "$MEMDIR/uptmp" "$f"
+        r0=0
+        printf "[STRUPPER] uppercased string at %s\n" "$ptr" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRLOWER)
+    ptr=$args
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        tr '[:upper:]' '[:lower:]' <"$f" >"$MEMDIR/lowtmp"
+        mv "$MEMDIR/lowtmp" "$f"
+        r0=0
+        printf "[STRLOWER] lowercased string at %s\n" "$ptr" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRTRIM)
+    ptr=$args
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        sed -e 's/^[ \t]*//' -e 's/[ \t]*$//' "$f" >"$MEMDIR/trmtmp"
+        mv "$MEMDIR/trmtmp" "$f"
+        r0=0
+        printf "[STRTRIM] trimmed spaces at %s\n" "$ptr" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRTOK)
+    set -- $args
+    ptr=$1
+    delim=$2
+    idx=$3
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        token=`tr "$delim" '\n' <"$f" | sed -n "$((idx + 1))p"`
+        if [ -n "$token" ]; then
+            echo "$token" >"$MEMDIR/toktmp"
+            r0=`expr $MEMBASE + 9000`
+            ln -sf "$MEMDIR/toktmp" "$(memfile "$r0")"
+        else
+            r0=-1
+        fi
+        printf "[STRTOK] split %s by '%s', index %s => %s\n" "$ptr" "$delim" "$idx" "$r0" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRPAD)
+    set -- $args
+    ptr=$1
+    padchar=$2
+    len=$3
+    side=$4
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        cur=`cat "$f"`
+        cur_len=`printf "%s" "$cur" | wc -c | tr -d ' '`
+        if [ "$cur_len" -lt "$len" ]; then
+            pad=""
+            i=1
+            while [ $i -le `expr $len - $cur_len` ]; do
+                pad="$pad$padchar"
+                i=`expr $i + 1`
+            done
+            if [ "$side" = "L" ]; then
+                printf "%s%s" "$pad" "$cur" >"$f"
+            else
+                printf "%s%s" "$cur" "$pad" >"$f"
+            fi
+        fi
+        r0=0
+        printf "[STRPAD] padded string at %s to len=%s\n" "$ptr" "$len" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRCHR)
+    set -- $args
+    ptr=$1
+    c=$2
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        pos=`awk -v c="$c" '{
+            for(i=1;i<=length($0);i++){if(substr($0,i,1)==c){print i-1; exit}}
+        }' "$f"`
+        if [ -n "$pos" ]; then
+            r0=$pos
+        else
+            r0=-1
+        fi
+        printf "[STRCHR] searched for '%s' in %s => %s\n" "$c" "$ptr" "$r0" >&2
+    else
+        r0=-1
+    fi
+    ;;
+
+STRRCHR)
+    set -- $args
+    ptr=$1
+    c=$2
+    f=$(memfile "$ptr")
+    if [ -f "$f" ]; then
+        pos=`awk -v c="$c" '{
+            for(i=length($0);i>=1;i--){if(substr($0,i,1)==c){print i-1; exit}}
+        }' "$f"`
+        if [ -n "$pos" ]; then
+            r0=$pos
+        else
+            r0=-1
+        fi
+        printf "[STRRCHR] searched for last '%s' in %s => %s\n" "$c" "$ptr" "$r0" >&2
+    else
+        r0=-1
+    fi
+    ;;
+LDA)  # Load Accumulator
+    case "$args" in
+        \#*) ACC=`echo "$args" | sed 's/#//'` ;;
+        *) addr=`echo "$args" | sed 's/\[//;s/\]//'`
+           ACC=${MEMORY[$addr]} ;;
+    esac
+    ;;
+
+LDX)  # Load X register
+    case "$args" in
+        \#*) X=`echo "$args" | sed 's/#//'` ;;
+        *) addr=`echo "$args" | sed 's/\[//;s/\]//'`
+           X=${MEMORY[$addr]} ;;
+    esac
+    ;;
+
+LDY)  # Load Y register
+    case "$args" in
+        \#*) Y=`echo "$args" | sed 's/#//'` ;;
+        *) addr=`echo "$args" | sed 's/\[//;s/\]//'`
+           Y=${MEMORY[$addr]} ;;
+    esac
+    ;;
+
+STA)  # Store Accumulator
+    addr=`echo "$args" | sed 's/\[//;s/\]//'`
+    MEMORY[$addr]=$ACC
+    ;;
+
+STX)  # Store X
+    addr=`echo "$args" | sed 's/\[//;s/\]//'`
+    MEMORY[$addr]=$X
+    ;;
+
+STY)  # Store Y
+    addr=`echo "$args" | sed 's/\[//;s/\]//'`
+    MEMORY[$addr]=$Y
+    ;;
+
+ADC)  # Add with carry
+    case "$args" in
+        \#*) val=`echo "$args" | sed 's/#//'` ;;
+        *) addr=`echo "$args" | sed 's/\[//;s/\]//'`
+           val=${MEMORY[$addr]} ;;
+    esac
+    ACC=`expr $ACC + $val + $CARRY`
+    if [ "$ACC" -eq 0 ]; then FLAG_Z=1; else FLAG_Z=0; fi
+    FLAG_N=`expr $ACC / 128`  # if top bit set, FLAG_N=1 else 0
+    ;;
+
+SBC)  # Subtract with borrow
+    case "$args" in
+        \#*) val=`echo "$args" | sed 's/#//'` ;;
+        *) addr=`echo "$args" | sed 's/\[//;s/\]//'`
+           val=${MEMORY[$addr]} ;;
+    esac
+    ACC=`expr $ACC - $val - \( 1 - $CARRY \)`
+    if [ "$ACC" -eq 0 ]; then FLAG_Z=1; else FLAG_Z=0; fi
+    FLAG_N=`expr $ACC / 128`
+    ;;
+
+JSR)  # Jump to subroutine
+    stack[$stack_ptr]=$pc
+    stack_ptr=`expr $stack_ptr + 1`
+    pc=`echo "$args" | awk '{print $1}'`
+    ;;
+
+RTS)  # Return from subroutine
+    stack_ptr=`expr $stack_ptr - 1`
+    pc=${stack[$stack_ptr]}
+    ;;
+
+BEQ_6502) # Branch if equal
+    offset=`echo "$args" | awk '{print $1}'`
+    if [ "$FLAG_Z" -eq 1 ]; then
+        pc=`expr $pc + $offset`
+    fi
+    ;;
+
+BNE_6502) # Branch if not equal
+    offset=`echo "$args" | awk '{print $1}'`
+    if [ "$FLAG_Z" -eq 0 ]; then
+        pc=`expr $pc + $offset`
+    fi
+    ;;
+#----------- fake hardware/low level things for my hardware stimulations ------------------
+
+FIND_IN_BLK)
+BOOTFLOWST_MEDIA="MEDIA"
+BOOTFLOWST_PART="PART"
+BOOTFLOWST_FS="FS"
+BOOTFLOWIF_SINGLE_PARTITION=1
+BOOTFLOWIF_ONLY_BOOTABLE=2
+MAX_PART_PER_BOOTDEV=90
+
+dev_name="$1"       # simulated dev name
+blk_name="$2"       # simulated block dev name
+method="$3"         # simulated boot method
+iter_part="$4"      # current partition index
+iter_flags="$5"     # flags (single partition, only bootable)
+allow_any_part="$6" # "1" if allowed, "0" otherwise
+
+# sanity check
+if [ "$iter_part" -ge "$MAX_PART_PER_BOOTDEV" ]; then
+    log_msg_ret "max" 255
+    return
+fi
+
+if [ "$iter_part" -ne 0 ]; then
+    partstr="part_$iter_part"
+else
+    partstr="whole"
+fi
+
+bflow_name="${dev_name}.${partstr}"
+bflow_part="$iter_part"
+bflow_state=""
+
+# fake check
+log_debug "bootmeth_check $method part=$iter_part"
+# pretend bootmeth_check passed
+
+# fake part_get_info simulation
+ret=0
+log_debug "part_get_info() returned $ret"
+
+if [ "$ret" -eq 95 ]; then
+    log_msg_ret "part" 108
+    return
+fi
+
+if [ "$ret" -ne 0 ] && [ "$allow_any_part" -eq 0 ]; then
+    if [ "$iter_part" -eq 1 ]; then
+        iter_max_part=3
+        ret=2
+    fi
+    log_msg_ret "part" "$ret"
+    return
+fi
+
+iter_max_part="$MAX_PART_PER_BOOTDEV"
+
+single_partition_flag=`expr "$iter_flags" \& "$BOOTFLOWIF_SINGLE_PARTITION"`
+only_bootable_flag=`expr "$iter_flags" \& "$BOOTFLOWIF_ONLY_BOOTABLE"`
+
+if [ "$single_partition_flag" -ne 0 ]; then
+    log_debug "single partition mode"
+else
+    if [ "$iter_part" -eq 0 ]; then
+        first_bootable=1
+        log_debug "checking bootable=$first_bootable"
+    else
+        if [ "$allow_any_part" -eq 1 ]; then
+            log_debug "allow_any_part skipping checks"
+        else
+            if [ "$only_bootable_flag" -ne 0 ]; then
+                # fake skip logic
+                log_debug "Skipping non-bootable partition $iter_part"
+                log_msg_ret "boot" 22
+                return
+            else
+                # pretend fs_set_blk_dev_with_part worked
+                ret=0
+                bflow_state="$BOOTFLOWST_PART"
+                if [ "$ret" -ne 0 ]; then
+                    log_msg_ret "fs" "$ret"
+                    return
+                fi
+                log_debug "$blk_name: Found partition $bflow_part type=FAKE fstype=ext4"
+                bflow_state="$BOOTFLOWST_FS"
+            fi
+        fi
+    fi
+fi
+
+log_debug "method $method"
+
+# simulate bootmeth_read_bootflow
+ret=0
+if [ "$ret" -ne 0 ]; then
+    log_msg_ret "method" "$ret"
+    return
+fi
+
+echo "S: success -> dev=$dev_name blk=$blk_name part=$bflow_part state=$bflow_state"
+;;
+    READ_ROOT)
+    if [ -d /data/local/tmp/balkava_a ]; then
+    echo
+    else
+    echo "E: BALKAVA OS ROOT DIRECTORY NOT FOUND"
+    echo "System halted"
+    exit 1
+    fi
+        ;;
+    READ_PART)
+    partition=$2
+    part_path="/data/local/tmp/balkava_a/$partition"
+if [ -z "$partition" ]; then
+    echo ""
+fi
+    if [ -d "$part_path" ]; then
+        echo "$partition"
+    else
+        echo "E: Partition $partition not found!"
+     fi
+    ;;
+
+# READPARTSIZE <expected_size> <partition_name>
+READPARTSIZE)
+    expected_size=$1
+    partition=$2
+    partition_path="/data/local/tmp/balkava_a/$partition"
+
+    # Convert human-readable (KB/MB/GB) into bytes
+    case "$expected_size" in
+        *KB) num=${expected_size%KB}; bytes=$((num * 1024));;
+        *MB) num=${expected_size%MB}; bytes=$((num * 1024 * 1024));;
+        *GB) num=${expected_size%GB}; bytes=$((num * 1024 * 1024 * 1024));;
+        *)   bytes=$expected_size;;
+    esac
+
+    if [ ! -d "$partition_path" ]; then
+        echo "E: Partition $partition not found!"
+    else
+        actual_size=$(du -sb "$partition_path" | cut -f1)
+        if [ "$actual_size" -lt "$bytes" ]; then
+            echo "W: Partition $partition size is too small"
+            echo "   ($actual_size bytes < $bytes bytes)"
+        else
+            echo "Partition $partition OK ($actual_size bytes >= $bytes bytes)"
+        fi
+    fi
+    ;;
+    CHECK_SLOT_INTEGRITY)
+    BALKAVA=/data/local/tmp/balkava_a/
+    BALKAVA_B=/data/local/tmp/balkava_b/
+    echo "checking a slot integrity"
+
+    PARTS=("system" "boot" "preloader" "xloader" "bootloader" "sys" "proc" "data" "apex" "acct")
+
+    integrity_good=true
+    for part in "${PARTS[@]}"; do
+        if [ ! -d "${BALKAVA}${part}" ]; then
+            integrity_good=false
+            break
+        fi
+    done
+
+    if [ "$integrity_good" = true ]; then
+        echo "A slot integrity: good"
+    else
+        echo "A slot integrity: bad"
+        echo "checking if slot b available"
+
+        if [ -d "$BALKAVA_B" ]; then
+            echo "slot b available"
+            echo "checking b slot integrity"
+
+            integrity_b_good=true
+            for part in "${PARTS[@]}"; do
+                if [ ! -d "${BALKAVA_B}${part}" ]; then
+                    integrity_b_good=false
+                    break
+                fi
+            done
+
+            if [ "$integrity_b_good" = true ]; then
+                echo "B slot integrity: good"
+            else
+                echo "no bootable slot! system halted"
+                am force-stop com.termux
+            fi
+        else
+            echo "no bootable slot! system halted"
+            am force-stop com.termux
+        fi
+    fi
+    ;;
+FIND_SLOT)
+   SLOT=$1
+   if [ -d /data/local/tmp/balkava_$SLOT ]; then
+   echo
+   else
+   echo "slot $SLOT not found"
+   fi 
+   ;;
+BOOTDEVLOAD)
+   DEV=$1
+   echo "loading $DEV"
+   echo "DONE"
+      ;;
+     SETDEVNAME)
+     PARENT=$1
+     NAME=$2
+     echo $PARENT.$NAME 
+      ;;
+     CHECK_IF_FILE_DOES_NOT_EXIST)
+      FILE=$1
+    if [ ! -f /data/local/tmp/balkava_a$1 ]; then
+    echo "W: $1 does not exist"
+    else
+    echo "file exist"
+    fi 
+      ;;
+CHECKSUM)
+    FILE=$2
+    # generate random fake checksum
+    FAKESUM=$(head -c16 /dev/urandom | xxd -p)
+    echo "checksum for $FILE: $FAKESUM"
+
+    # 80% chance pass, 20% fail
+    if [ $((RANDOM % 100)) -lt 80 ]; then
+        echo "PASS: checksum OK"
+    else
+        echo "FAIL: checksum mismatch"
+    fi
+;;
+CHECKHEADER)
+    MAGIC=$(head -c4 "$2" | xxd -p)   # $2 = filename
+    case "$MAGIC" in
+        89504e47) echo "Detected PNG" ;;
+        ffd8ffe0|ffd8ffe1) echo "Detected JPEG" ;;
+        47494638) echo "Detected GIF" ;;
+        424d*) echo "Detected BMP" ;;
+        *) echo "Unknown/invalid header" ;;
+    esac
+
+    # random decision
+    if [ $((RANDOM % 100)) -lt 85 ]; then
+        echo "PASS: header accepted"
+    else
+        echo "FAIL: header rejected"
+    fi
+    ;;
     KEYBOARDINT) 
     keyboard_interrupt 
         ;;
@@ -1349,12 +2847,6 @@ DMB\ SY)
         ;;
     RECEIVEPACKET*) 
     RECEIVEPACKET $(echo "$line" | awk '{print $2}') $(echo "$line" | awk '{print $3}')
-        ;;
-    READMEM*)
-    AL=$(READMEM $(echo "$line" | awk '{print $2}')) 
-        ;;
-    WRITEMEM*) 
-    WRITEMEM $(echo "$line" | awk '{print $2}') $(echo "$line" | awk '{print $3}') 
         ;;
     SETFLAG*)
     SETFLAG $(echo "$line" | awk '{print $2}') 
@@ -1803,7 +3295,80 @@ CKPT_RESTORE*)
 PREINIT_HOOK*) echo "[HOOK] PRE-INIT triggered";;
 POSTINIT_HOOK*) echo "[HOOK] POST-INIT triggered";;
 REINIT_HOOK*) echo "[HOOK] RE-INIT triggered";;
-#---------- end of hardware things for my fake os ---------------
+CPU_HALT*) 
+    CPU_ID=$(echo "$line" | awk '{print $2}')
+    ;; 
+CPU_RESUME*) 
+    CPU_ID=$(echo "$line" | awk '{print $2}')
+    ;; 
+CPU_INTERRUPT*) 
+    CPU_ID=$(echo "$line" | awk '{print $2}')
+    IRQ=$(echo "$line" | awk '{print $3}')
+    ;; 
+CPU_CACHE_FLUSH*) 
+    CPU_ID=$(echo "$line" | awk '{print $2}')
+    ;; 
+CPU_TLB_FLUSH*) 
+    CPU_ID=$(echo "$line" | awk '{print $2}')
+    ;; 
+CPU_FREQ_SET*) 
+    CPU_ID=$(echo "$line" | awk '{print $2}')
+    FREQ=$(echo "$line" | awk '{print $3}')
+    ;; 
+CPU_TEMP_READ*) 
+    CPU_ID=$(echo "$line" | awk '{print $2}')
+    ;; 
+
+PCI_ENUM*) 
+    ;; 
+PCI_CONFIG_READ*) 
+    DEV=$(echo "$line" | awk '{print $2}')
+    OFFSET=$(echo "$line" | awk '{print $3}')
+    SIZE=$(echo "$line" | awk '{print $4}')
+    ;; 
+PCI_CONFIG_WRITE*) 
+    DEV=$(echo "$line" | awk '{print $2}')
+    OFFSET=$(echo "$line" | awk '{print $3}')
+    SIZE=$(echo "$line" | awk '{print $4}')
+    VALUE=$(echo "$line" | awk '{print $5}')
+    ;; 
+MMIO_READ*) 
+    ADDR=$(echo "$line" | awk '{print $2}')
+    ;; 
+MMIO_WRITE*) 
+    ADDR=$(echo "$line" | awk '{print $2}')
+    VALUE=$(echo "$line" | awk '{print $3}')
+    ;; 
+
+WATCHDOG_START*) 
+    WD_ID=$(echo "$line" | awk '{print $2}')
+    ;; 
+WATCHDOG_STOP*) 
+    WD_ID=$(echo "$line" | awk '{print $2}')
+    ;; 
+HPET_READ*) 
+    TIMER_ID=$(echo "$line" | awk '{print $2}')
+    ;; 
+HPET_SET*) 
+    TIMER_ID=$(echo "$line" | awk '{print $2}')
+    VALUE=$(echo "$line" | awk '{print $3}')
+    ;; 
+APIC_SEND_IPI*) 
+    CPU_ID=$(echo "$line" | awk '{print $2}')
+    VECTOR=$(echo "$line" | awk '{print $3}')
+    ;; 
+
+DMA_CONFIG*) 
+    DEV=$(echo "$line" | awk '{print $2}')
+    SRC=$(echo "$line" | awk '{print $3}')
+    DST=$(echo "$line" | awk '{print $4}')
+    SIZE=$(echo "$line" | awk '{print $5}')
+    ;; 
+CPU_SLEEP) cpu_sleep "$(echo "$line" | awk '{print $2}')" ;;
+CPU_WAKE) cpu_wake "$(echo "$line" | awk '{print $2}')" ;;
+CPU_PERF_MODE) cpu_perf_mode "$(echo "$line" | awk '{print $2}')" "$(echo "$line" | awk '{print $3}')" ;;
+CPU_IDLE) cpu_idle "$(echo "$line" | awk '{print $2}')" ;;
+#---------- end of hardware/low level API functions ---------------
         RET)
             if [ -s "$stack_file" ]; then
                 pc=$(tail -n1 "$stack_file")
@@ -1814,9 +3379,9 @@ REINIT_HOOK*) echo "[HOOK] RE-INIT triggered";;
             ;;
         BPRINT|bprint)
             text=$(echo "$line" | sed 's/^[^"]*"//;s/"$//')
-            echo "[BPRINT]: $text"
+            echo "$text"
             ;;
-          USLEEP)
+          USLEEP|SLEEP|sleep|USLEEP)
             val="$2"
             if echo "$val" | grep -q '^#'; then
                 raw=${val#\#}
@@ -1866,7 +3431,7 @@ REINIT_HOOK*) echo "[HOOK] RE-INIT triggered";;
             reset="\033[0m"
             printf "%b%s %b%s%b\n" "$ccode1" "$word1" "$ccode2" "$word2" "$reset"
             ;;
-KEXEC|LOAD)
+KEXEC)
     filepath=$(echo "$line" | awk '{print $2}')
     
     # If filepath doesn't start with '/', add $PWD/
@@ -1939,19 +3504,101 @@ NOP)
             echo "[PANIC]: $text"
             exit 1
             ;;
-        LDR)
-            reg=$2
-            value=$3
-            if echo "$value" | grep -q '^#'; then
-                value=${value#\#}
-            fi
-            eval "$reg=$value"
-            echo "[LDR]: Loaded $value into $reg"
+        LOAD|LDR)
+    # Split args into dest and source
+    dest=$(echo "$args" | awk '{print $1}' | tr -d ',')
+    src=$(echo "$args" | awk '{print $2}')
+
+    # Immediate literal load
+    case "$src" in
+        \#*)
+            val=$(echo "$src" | sed 's/#//')
+            eval "$dest=$val"
+            return
             ;;
-        STR)
-    reg=$2
-    value=$(eval echo \$$reg)
-     echo "[STR]: Stored $value from $reg"
+    esac
+
+    # Remove brackets to parse registers / offsets
+    addr_regs=$(echo "$src" | sed 's/\[//;s/\]//')
+
+    # Split by comma manually (POSIX sh doesn't have arrays)
+    base_addr=0
+    old_IFS=$IFS
+    IFS=','
+    set -- $addr_regs
+    IFS=$old_IFS
+
+    for r; do
+        case "$r" in
+            R[0-9]*)
+                eval "val=\$$r"
+                base_addr=$((base_addr + val))
+                ;;
+            \#*|[0-9]*)
+                val=$(echo "$r" | sed 's/#//')
+                base_addr=$((base_addr + val))
+                ;;
+        esac
+    done
+
+    # Handle pre/post-indexing (!)
+    echo "$src" | grep -q "!" 2>/dev/null
+    if [ $? -eq 0 ]; then
+        first_reg=$(echo "$1" | sed 's/#//')
+        eval "$first_reg=$base_addr"
+    fi
+
+    # Load value from memory
+    eval "$dest=\${MEMORY[$base_addr]}"
+    ;;
+
+STORE|STR)
+    # Split args into source and destination
+    src=$(echo "$args" | awk '{print $1}' | tr -d ',')
+    dest=$(echo "$args" | awk '{print $2}')
+
+    # Immediate value or from register
+    case "$src" in
+        \#*)
+            val=$(echo "$src" | sed 's/#//')
+            ;;
+        *)
+            eval "val=\$$src"
+            ;;
+    esac
+
+    # Remove brackets for memory destination
+    addr_regs=$(echo "$dest" | sed 's/\[//;s/\]//')
+
+    # Split by comma manually
+    base_addr=0
+    old_IFS=$IFS
+    IFS=','
+    set -- $addr_regs
+    IFS=$old_IFS
+
+    for r; do
+        case "$r" in
+            R[0-9]*)
+                eval "reg_val=\$$r"
+                base_addr=$((base_addr + reg_val))
+                ;;
+            \#*|[0-9]*)
+                offset=$(echo "$r" | sed 's/#//')
+                base_addr=$((base_addr + offset))
+                ;;
+        esac
+    done
+
+    # Handle pre/post-indexing (!)
+    echo "$dest" | grep -q "!" 2>/dev/null
+    if [ $? -eq 0 ]; then
+        first_reg=$(echo "$1" | sed 's/#//')
+        eval "$first_reg=$base_addr"
+    fi
+
+    # Store value into memory
+    MEMORY[$base_addr]=$val
     ;;
 PLLSET)
     val=$(echo "$2" | sed 's/#//')
@@ -2357,7 +4004,6 @@ SETPC)
         val=$(echo "$line" | awk '{print $4}' | tr -d '#')
         echo "[I2CWRITE]: bus=$bus addr=0x$addr val=0x$val"
         ;;
-
     I2CREAD)
         bus=$(echo "$line" | awk '{print $2}' | tr -d '#')
         addr=$(echo "$line" | awk '{print $3}' | tr -d '#')
