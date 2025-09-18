@@ -4,8 +4,8 @@
 BASM_FILE="$1"
 TMPDIR="/data/local/tmp/balkava_a/cache/basm_$$"
 mkdir -p "$TMPDIR"
-STATE_ROOT=/data/local/tmp/balkava_a
-# POSIX-compliant basmrun hardware API extension for Balkava OS
+STATE_ROOT=/data/local/tmp/balkava_a 
+# fake hardware API extension for Balkava OS
 LOGFILE="/data/local/tmp/balkava_hardware/logs.txt"
 mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
 : > "$LOGFILE" 2>/dev/null || true
@@ -56,14 +56,14 @@ memfile() {
     printf '%s/%s.bin' "$MEMDIR" "$1"
 }
 
-# PRINT wrapper used by BASM scripts
+# PRINT wrapper used by functions
 PRINT() {
     text=$1
     color=${2:-32}
     UARTPRINT "$text" "$color"
 }
 
-# key=value parser helper (POSIX-safe)
+# key=value parser helper
 kv() {
     key=$1
     args=$2
