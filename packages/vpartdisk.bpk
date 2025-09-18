@@ -52,9 +52,7 @@ kb_to_human() {
 # list fake devices
 detect_devices() {
   echo "mmcblk0"
-  echo "sda"
-  echo "zram0"
-  echo "ufs0"
+  echo "sda0"
   i=0
   while [ $i -le 3 ]; do
     echo "dm-$i"
@@ -68,7 +66,6 @@ device_fake_size() {
   case "$dev" in
     mmcblk*) echo "$FAKE_SIZE_MM" ;;
     sda) echo "512G" ;;
-    zram*) echo "10G" ;;
     *) echo "$DEFAULT_SIZE" ;;
   esac
 }
